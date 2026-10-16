@@ -2,7 +2,7 @@
 
 A small, persistent task queue for Go, backed by PostgreSQL or SQLite. A simple alternative to [River](https://riverqueue.com/), following the design of [failsafe-executor](https://github.com/oliverselinger/failsafe-executor).
 
-- **One file, no dependencies.** Uses only `database/sql` from the standard library. No reflection.
+- **One file, no dependencies.** Uses only `database/sql` from the standard library. No reflection. Native [pgx](https://github.com/jackc/pgx) support lives in the separate `pgxq` module.
 - **One table.** All state lives in `workq_tasks`.
 - **At-least-once execution.** A task is deleted only after it succeeds. Tasks held by a crashed node are picked up again once their lock times out.
 - **Transactional.** Enqueue tasks in your own transaction. Run handlers inside a transaction that commits together with the task's removal.
@@ -15,7 +15,8 @@ A small, persistent task queue for Go, backed by PostgreSQL or SQLite. A simple 
 ## Install
 
 ```sh
-go get github.com/nobloat/workq
+go get github.com/nobloat/workq       # database/sql: Postgres or SQLite
+go get github.com/nobloat/workq/pgxq  # native pgx (pgxpool, pgx.Tx)
 ```
 
 Requires PostgreSQL, or SQLite 3.35 or later (for `RETURNING`).
@@ -25,6 +26,7 @@ Requires PostgreSQL, or SQLite 3.35 or later (for `RETURNING`).
 ```go
 db, _ := sql.Open("pgx", dsn)
 db.SetMaxOpenConns(8 + 2) // workers + poll loop + heartbeat
+db.SetMaxIdleConns(8 + 2) // the default of 2 makes busy workers reconnect constantly
 
 q := workq.NewPostgres(db, "", 8, slog.Default()) // "" = default queue
 if err := q.CreateTable(ctx); err != nil {
@@ -44,6 +46,22 @@ defer func() {
 
 id, err := q.Enqueue(ctx, workq.Task{Name: "send-email", Param: `{"to":"a@b.c"}`})
 ```
+
+### pgx
+
+`workq.Queue[T]` is generic over the transaction type that `RegisterTx` handlers and the `…Tx` methods use. `NewPostgres` and `NewSQLite` return a `*workq.Queue[*sql.Tx]`. `pgxq.New` returns a `*workq.Queue[pgx.Tx]` on a `pgxpool.Pool`:
+
+```go
+pool, _ := pgxpool.New(ctx, dsn)
+q := pgxq.New(pool, "", 8, slog.Default())
+
+q.RegisterTx("charge-order", func(ctx context.Context, tx pgx.Tx, param string) error {
+    _, err := tx.Exec(ctx, `UPDATE orders SET paid = true WHERE id = $1`, param)
+    return err
+})
+```
+
+Everything else works the same. Other clients can be plugged in by implementing `workq.Driver[T]`.
 
 ## Schema
 
@@ -249,7 +267,7 @@ Running tasks send a heartbeat every `LockTimeout / 3`.
 
 ## Database notes
 
-- **Postgres:** each running `RegisterTx` handler holds a connection. Set `db.SetMaxOpenConns` to at least `workers + 2`, summed over all executors sharing the pool.
+- **Postgres:** each running `RegisterTx` handler holds a connection. Set `db.SetMaxOpenConns` to at least `workers + 2`, summed over all executors sharing the pool, and `db.SetMaxIdleConns` to the same value: with the default of 2, throughput collapses under load because connections are closed and reopened. With pgx, set `MaxConns` on the pool config.
 - **SQLite:** set a `busy_timeout` (for example `_pragma=busy_timeout(5000)` with modernc.org/sqlite). SQLite has a single writer, so a `RegisterTx` handler that writes blocks other writers until it commits.
 
 ## How it works
