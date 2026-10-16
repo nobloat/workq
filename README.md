@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS workq_tasks (
   failed_at  BIGINT,
   created_at BIGINT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS workq_tasks_due ON workq_tasks (queue, run_at) WHERE failed_at IS NULL;
+CREATE INDEX IF NOT EXISTS workq_tasks_due ON workq_tasks (queue, run_at, id) WHERE failed_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS workq_tasks_scheduled ON workq_tasks (name) WHERE scheduled;
 ```
 
@@ -268,13 +268,57 @@ Running tasks send a heartbeat every `LockTimeout / 3`.
 ## Database notes
 
 - **Postgres:** each running `RegisterTx` handler holds a connection. Set `db.SetMaxOpenConns` to at least `workers + 2`, summed over all executors sharing the pool, and `db.SetMaxIdleConns` to the same value: with the default of 2, throughput collapses under load because connections are closed and reopened. With pgx, set `MaxConns` on the pool config.
-- **SQLite:** set a `busy_timeout` (for example `_pragma=busy_timeout(5000)` with modernc.org/sqlite). SQLite has a single writer, so a `RegisterTx` handler that writes blocks other writers until it commits.
+- **SQLite:** use WAL with `synchronous=NORMAL` and set a `busy_timeout`, for example `?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_txlock=immediate` with modernc.org/sqlite. `synchronous=NORMAL` stops waiting for the disk on every commit: an app crash loses nothing, while a power loss can lose the last commits. That doubled enqueue throughput in the benchmark. `_txlock=immediate` makes transactions take the write lock when they begin, which avoids `SQLITE_BUSY` errors when a read turns into a write. SQLite has a single writer, so workq queues its own statements per `*sql.DB` in Go instead of letting them race for the write lock and back off in SQLite's busy handler. A `RegisterTx` handler that writes still blocks all other writers until it commits.
+
+## Performance
+
+[`tests/bench_test.go`](tests/bench_test.go) measures the raw overhead of workq with no-op tasks. `p` producers enqueue the tasks concurrently, then one executor with `p` workers runs them all:
+
+```sh
+cd tests && go test -run XXX -bench Throughput -benchtime 5000x -count 3 ./...
+```
+
+Medians of 3 runs with 5,000 tasks each, in tasks per second:
+
+| p  | SQLite enqueue | SQLite exec | Postgres (`database/sql`) enqueue | Postgres (`database/sql`) exec | Postgres (`pgxq`) enqueue | Postgres (`pgxq`) exec |
+|----|-------:|-------:|-------:|-------:|-------:|-------:|
+| 1  | 34,363 | 9,084  | 2,903  | 1,216  | 3,038  | 1,171  |
+| 4  | 33,296 | 13,118 | 7,672  | 3,648  | 8,096  | 3,816  |
+| 16 | 34,922 | 35,424 | 15,686 | 13,836 | 15,499 | 13,875 |
+| 64 | 33,677 | 70,276 | 26,885 | 30,978 | 26,068 | 24,735 |
+
+Machine: MacBook Pro (Mac15,10), Apple M3 Max (10 performance + 4 efficiency cores), 36 GB RAM, macOS 26.7.1, Go 1.27.2. SQLite via modernc.org/sqlite v1.60.1, a file on the local SSD with the settings from [Database notes](#database-notes). PostgreSQL 17.11 (`postgres:17-alpine`, default config) in Docker Desktop 29.4.0, accessed with pgx v5.11.0.
+
+- **More workers, more throughput.** Concurrent completions are deleted in one statement, and one claim fills several free workers, so the cost per task drops as load rises.
+- **Postgres pays for round trips.** At p=1 every task waits for a claim and a delete round trip. Docker Desktop adds network overhead to each of them, so expect higher numbers with Postgres on a Linux host.
+- **`database/sql` and `pgxq` perform the same.** The driver isn't the bottleneck. Pick `pgxq` for `pgx.Tx` in handlers, not for speed. This only holds when `SetMaxIdleConns` matches `SetMaxOpenConns`; with the default of 2 idle connections, `database/sql` reached only about 2,000 tasks/s at p=64.
+- **Enqueue is one INSERT per task.** It is bounded by round trips on Postgres and by the single writer on SQLite. There is no bulk insert.
+- **Large backlogs don't slow it down.** In separate runs that worked through 1,000,000 tasks already inserted, the rate stayed level from the first task to the last: on Postgres about 30,000 tasks/s with 64 workers and about 66,000 with 2,000 workers, on SQLite about 70,000 with 64 workers. See [How it works](#how-it-works) for what keeps claims cheap.
+- **These are upper bounds.** Real tasks add their own run time, and with tasks that take milliseconds or more, the number of workers matters more than workq's overhead.
+
+### Compared to River
+
+[River](https://riverqueue.com/) ships its own benchmark, `river bench -n 1000000`. It inserts one million no-op jobs, then works them down with 2,000 workers on a default pgx pool. I ran it and the same scenario for workq on the machine and Postgres container above. Only the time to work down the jobs counts; inserting them doesn't:
+
+| | 1,000,000 tasks | tasks/s |
+|---|---:|---:|
+| River v0.49.0 (`river bench`) | 19.3 s | 51,839 |
+| workq, `pgxq`, 2,000 workers, 14 connections | 15.2 s | 65,712 |
+| workq, `database/sql`, 2,000 workers, 14 connections | 15.1 s | 66,009 |
+
+Each number is a single run. workq's run inserted the tasks with one SQL `INSERT … SELECT generate_series(…)` and counted completions through `OnEvent`; that throwaway test isn't in the repo. Results at p=64 vary by about ±15% between runs.
+
+The comparison only measures overhead per job. River does more for each job: it keeps completed jobs for later inspection instead of deleting them, and it tracks attempts, retries with backoff, priorities and unique jobs. It also has typed job arguments, a web UI and LISTEN/NOTIFY wake-ups. workq has none of these. It offers one file without dependencies, `database/sql` support, and the same API for SQLite and Postgres.
 
 ## How it works
 
 1. **Claiming:** every `PollInterval`, an executor claims up to `free workers` due tasks with one statement:
-   - **Postgres:** `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED LIMIT n) RETURNING …`.
-   - **SQLite:** the same statement without `SKIP LOCKED`. It is atomic because SQLite has only one writer.
+   - **Postgres:** `UPDATE … WHERE id = ANY(ARRAY(SELECT … ORDER BY run_at, id LIMIT n FOR UPDATE SKIP LOCKED)) RETURNING …`.
+   - **SQLite:** `UPDATE … WHERE id IN (SELECT … ORDER BY run_at, id LIMIT n) RETURNING …`. It is atomic because SQLite has only one writer.
+
+   Postgres keeps index entries of deleted tasks until vacuum runs, and they sit at the front of the due-task index, exactly where each claim starts. With a backlog of a million tasks, claims slowed down by more than half until two changes:
+   - **Cursor:** each claim continues after the `(run_at, id)` where the previous one stopped. The `PollInterval` tick and every claim that returns fewer tasks than requested start from the beginning again, which picks up retried tasks, stale locks and tasks with an earlier `RunAt`.
+   - **`= ANY(ARRAY(…))` instead of `IN (…)`:** `IN` makes Postgres plan a join and, to estimate it, read the lowest ids from the primary key, which is where the dead entries are. That took 1–2 ms per claim. With `ANY(ARRAY(…))` the subquery runs once before the update and planning takes 0.04 ms.
 
    Claiming sets `locked_at` and increments `version`.
 2. **Eligibility:** a task can be claimed when all of these hold:
@@ -284,4 +328,4 @@ Running tasks send a heartbeat every `LockTimeout / 3`.
    - it hasn't failed
    - it is unlocked, or its lock is stale
 3. **Heartbeat:** a heartbeat refreshes `locked_at` while the task runs.
-4. **Finishing:** every finishing write checks `WHERE id = ? AND version = ?`, so a node whose lock was taken over cannot overwrite the result.
+4. **Finishing:** every finishing write checks `WHERE id = ? AND version = ?`, so a node whose lock was taken over cannot overwrite the result. Successful `Register` tasks are deleted by one goroutine that combines all deletes waiting while its previous statement ran into one statement: a single delete under light load, up to 100 under heavy load, without waiting for a batch to fill. `RegisterTx` tasks finish inside their own transaction.

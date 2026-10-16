@@ -51,7 +51,7 @@ func startPostgres() (func(), error) {
 		return nop, fmt.Errorf("docker run: %w", err)
 	}
 	id := strings.TrimSpace(string(out))
-	cleanup := func() { exec.Command("docker", "rm", "-f", id).Run() }
+	cleanup := func() { exec.Command("docker", "rm", "-f", "-v", id).Run() } // -v: also the anonymous data volume
 	out, err = exec.Command("docker", "port", id, "5432/tcp").Output()
 	if err != nil {
 		cleanup()
@@ -94,7 +94,7 @@ type node[T any] struct {
 }
 
 func setupSQLite(tb testing.TB) env[*sql.Tx] {
-	dsn := "file:" + filepath.Join(tb.TempDir(), "db.sqlite") + "?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_txlock=immediate"
+	dsn := "file:" + filepath.Join(tb.TempDir(), "db.sqlite") + "?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_txlock=immediate"
 	return sqlEnv(tb, "sqlite", dsn, workq.NewSQLite, "")
 }
 
@@ -175,8 +175,10 @@ func openSQL(tb testing.TB, driver, dsn string, maxConns int) *sql.DB {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	db.SetMaxOpenConns(maxConns)
-	db.SetMaxIdleConns(maxConns) // the default of 2 makes busy workers reconnect constantly
+	if maxConns > 0 {
+		db.SetMaxOpenConns(maxConns)
+		db.SetMaxIdleConns(maxConns) // the default of 2 makes busy workers reconnect constantly
+	}
 	tb.Cleanup(func() { db.Close() })
 	return db
 }

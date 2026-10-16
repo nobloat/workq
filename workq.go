@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -93,6 +94,19 @@ type Queue[T any] struct {
 	runCancel  context.CancelFunc
 	loopDone   chan struct{}
 	hbDone     chan struct{}
+	finishes   chan finishReq
+	finDone    chan struct{}
+}
+
+// finishReq asks the finisher to delete a completed task.
+type finishReq struct {
+	id, version int64
+	res         chan finishRes
+}
+
+type finishRes struct {
+	ok  bool
+	err error
 }
 
 // id orders tasks within a queue. SQLite needs AUTOINCREMENT so ids of deleted tasks are never reused.
@@ -115,7 +129,7 @@ const columns = `
   failed_at  BIGINT,
   created_at BIGINT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS workq_tasks_due ON workq_tasks (queue, run_at) WHERE failed_at IS NULL;
+CREATE INDEX IF NOT EXISTS workq_tasks_due ON workq_tasks (queue, run_at, id) WHERE failed_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS workq_tasks_scheduled ON workq_tasks (name) WHERE scheduled;
 `
 
@@ -199,9 +213,11 @@ VALUES ($1, '', $2, TRUE, $3, $4) ON CONFLICT DO NOTHING`), name, q.queue, s(now
 	runCtx, runCancel := context.WithCancel(ctx)
 	loopCtx, loopCancel := context.WithCancel(runCtx)
 	q.runCancel, q.loopCancel = runCancel, loopCancel
-	q.loopDone, q.hbDone = make(chan struct{}), make(chan struct{})
+	q.loopDone, q.hbDone, q.finDone = make(chan struct{}), make(chan struct{}), make(chan struct{})
+	q.finishes = make(chan finishReq)
 	go q.poll(loopCtx, runCtx)
 	go q.heartbeat(runCtx)
+	go q.finisher(runCtx)
 }
 
 // Stop stops claiming tasks and waits for running ones; handler contexts are cancelled when ctx expires.
@@ -214,6 +230,7 @@ func (q *Queue[T]) Stop(ctx context.Context) error {
 	case <-done:
 		q.runCancel()
 		<-q.hbDone
+		<-q.finDone
 		return nil
 	case <-ctx.Done():
 		q.runCancel()
@@ -333,39 +350,51 @@ func (q *Queue[T]) poll(ctx, runCtx context.Context) {
 	defer close(q.loopDone)
 	tick := time.NewTicker(q.PollInterval)
 	defer tick.Stop()
+	// cursor is where the last claim stopped. Continuing from it skips index entries of deleted tasks,
+	// which on Postgres stay until vacuum and would otherwise be read again by every claim.
+	// Ticks and short claims rescan from the start, picking up whatever lies behind the cursor.
+	var cursor *Task
 	for {
-		q.claim(context.WithoutCancel(ctx), runCtx) // a claim cancelled mid-flight would leave tasks locked until LockTimeout
+		cursor = q.claim(context.WithoutCancel(ctx), runCtx, cursor) // a claim cancelled mid-flight would leave tasks locked until LockTimeout
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
+			cursor = nil
 		case <-q.wake:
 		}
 	}
 }
 
 // claimSQL picks due, unfailed, unlocked (or stale) tasks of this queue.
+// Postgres uses id = ANY(ARRAY(…)): with id IN (…) the planner estimates a join by reading the lowest
+// ids from the primary key, where deleted tasks leave dead entries until vacuum (1–2 ms per claim at 1M tasks).
 const claimSQL = `UPDATE workq_tasks SET locked_at = $1, version = version + 1
-WHERE id IN (
+WHERE id %s (
   SELECT id FROM workq_tasks t
   WHERE t.failed_at IS NULL AND t.run_at <= $1
     AND (t.locked_at IS NULL OR t.locked_at < $2)
-    AND t.queue = $4 AND t.name IN (%s)
-  ORDER BY t.id LIMIT $3%s)
+    AND t.queue = $4 AND (t.run_at, t.id) > ($5, $6) AND t.name IN (%s)
+  ORDER BY t.run_at, t.id LIMIT $3%s)%s
 RETURNING ` + taskCols + `, version, scheduled`
 
-func (q *Queue[T]) claim(ctx, runCtx context.Context) {
+// claim claims up to free tasks after cursor (from the start if nil) and returns the cursor for the next claim.
+func (q *Queue[T]) claim(ctx, runCtx context.Context, cursor *Task) *Task {
 	q.mu.Lock()
 	free := q.workers - len(q.running)
 	q.mu.Unlock()
 	if free <= 0 || len(q.handlers) == 0 {
-		return
+		return cursor
 	}
 	now := time.Now().UnixMilli()
-	args, ph := in([]any{now, now - q.LockTimeout.Milliseconds(), free, q.queue}, slices.Collect(maps.Keys(q.handlers)))
-	lock := ""
+	after := []any{int64(math.MinInt64), int64(0)}
+	if cursor != nil {
+		after = []any{cursor.RunAt.UnixMilli(), cursor.ID}
+	}
+	args, ph := in(append([]any{now, now - q.LockTimeout.Milliseconds(), free, q.queue}, after...), slices.Collect(maps.Keys(q.handlers)))
+	op, lock, end := "IN", "", ""
 	if !q.sqlite {
-		lock = " FOR UPDATE SKIP LOCKED"
+		op, lock, end = "= ANY(ARRAY", " FOR UPDATE SKIP LOCKED", ")"
 	}
 	type claimed struct {
 		t         Task
@@ -373,7 +402,7 @@ func (q *Queue[T]) claim(ctx, runCtx context.Context) {
 		scheduled bool
 	}
 	var cs []claimed
-	err := q.db.Query(ctx, q.rebind(fmt.Sprintf(claimSQL, ph, lock)), args, func(scan func(...any) error) (err error) {
+	err := q.db.Query(ctx, q.rebind(fmt.Sprintf(claimSQL, op, ph, lock, end)), args, func(scan func(...any) error) (err error) {
 		var c claimed
 		c.t, err = scanTask(scan, &c.version, &c.scheduled)
 		cs = append(cs, c)
@@ -383,13 +412,21 @@ func (q *Queue[T]) claim(ctx, runCtx context.Context) {
 		q.log.Error("workq: claim", "err", err)
 	}
 	// Workers start only after the result is closed: on SQLite an open result holds the write lock.
+	var last *Task
 	for _, c := range cs {
+		if last == nil || c.t.RunAt.After(last.RunAt) || c.t.RunAt.Equal(last.RunAt) && c.t.ID > last.ID {
+			last = &c.t // RETURNING has no order
+		}
 		q.mu.Lock()
 		q.running[c.t.ID] = c.version
 		q.mu.Unlock()
 		q.wg.Add(1)
 		go q.run(runCtx, c.t, c.version, c.scheduled)
 	}
+	if len(cs) < free {
+		return nil // nothing more after the cursor; rescan from the start next time
+	}
+	return last
 }
 
 func (q *Queue[T]) run(ctx context.Context, t Task, version int64, scheduled bool) {
@@ -417,7 +454,11 @@ func (q *Queue[T]) run(ctx context.Context, t Task, version int64, scheduled boo
 		herr, ok, err = q.runTx(ctx, dbCtx, h.txFn, t, version, s)
 	default:
 		if herr = protect(func() error { return h.fn(ctx, t.Param) }); herr == nil {
-			ok, err = q.done(dbCtx, q.db, t.ID, version, s)
+			if s == nil {
+				ok, err = q.finish(ctx, t.ID, version)
+			} else {
+				ok, err = q.done(dbCtx, q.db, t.ID, version, s)
+			}
 		}
 	}
 	if herr != nil {
@@ -459,6 +500,59 @@ func (q *Queue[T]) done(ctx context.Context, db Conn, id, version int64, s Sched
 	}
 	return q.exec(ctx, db, `UPDATE workq_tasks SET run_at = $1, locked_at = NULL WHERE id = $2 AND version = $3`,
 		s(time.Now()).UnixMilli(), id, version)
+}
+
+// finish deletes a completed task through the finisher, which batches concurrent deletes into one statement.
+func (q *Queue[T]) finish(ctx context.Context, id, version int64) (bool, error) {
+	r := finishReq{id, version, make(chan finishRes, 1)}
+	select {
+	case q.finishes <- r:
+		res := <-r.res
+		return res.ok, res.err
+	case <-ctx.Done(): // Stop timed out and the finisher is gone
+		return q.done(context.WithoutCancel(ctx), q.db, id, version, nil)
+	}
+}
+
+// finisher deletes whatever completed while the previous batch ran: one task under light load,
+// many under heavy load, without waiting for a batch to fill.
+func (q *Queue[T]) finisher(ctx context.Context) {
+	defer close(q.finDone)
+	for {
+		var batch []finishReq
+		select {
+		case <-ctx.Done():
+			return
+		case r := <-q.finishes:
+			batch = append(batch, r)
+		}
+	more:
+		for len(batch) < 100 {
+			select {
+			case r := <-q.finishes:
+				batch = append(batch, r)
+			default:
+				break more
+			}
+		}
+		var where []string
+		var args []any
+		for _, r := range batch {
+			args = append(args, r.id, r.version)
+			where = append(where, fmt.Sprintf("(id = $%d AND version = $%d)", len(args)-1, len(args)))
+		}
+		deleted := map[int64]bool{}
+		err := q.db.Query(context.WithoutCancel(ctx), q.rebind(`DELETE FROM workq_tasks WHERE `+strings.Join(where, " OR ")+` RETURNING id`), args,
+			func(scan func(...any) error) error {
+				var id int64
+				err := scan(&id)
+				deleted[id] = true
+				return err
+			})
+		for _, r := range batch {
+			r.res <- finishRes{deleted[r.id], err}
+		}
+	}
 }
 
 func (q *Queue[T]) heartbeat(ctx context.Context) {
@@ -551,22 +645,55 @@ type sqlDriver struct {
 	sqlite bool
 }
 
-func (d sqlDriver) DB() Conn                                     { return sqlConn{d.db} }
-func (d sqlDriver) Tx(tx *sql.Tx) Conn                           { return sqlConn{tx} }
+func (d sqlDriver) DB() Conn                                     { return sqlConn{d.db, d.lock()} }
+func (d sqlDriver) Tx(tx *sql.Tx) Conn                           { return sqlConn{tx, nil} }
 func (d sqlDriver) SQLite() bool                                 { return d.sqlite }
 func (d sqlDriver) Begin(ctx context.Context) (*sql.Tx, error)   { return d.db.BeginTx(ctx, nil) }
 func (d sqlDriver) Commit(_ context.Context, tx *sql.Tx) error   { return tx.Commit() }
 func (d sqlDriver) Rollback(_ context.Context, tx *sql.Tx) error { return tx.Rollback() }
 
-// sqlConn is satisfied by *sql.DB and *sql.Tx.
+// sqliteLocks holds one lock per SQLite *sql.DB. SQLite has a single writer: goroutines that
+// race for it lose to SQLITE_BUSY and sleep in the busy handler, while waiting for this lock is
+// instant. It serializes the statements of all executors on that *sql.DB in this process.
+// ponytail: entries live as long as the process; fine for the few DBs an app opens.
+var sqliteLocks sync.Map // *sql.DB -> chan struct{} with capacity 1
+
+func (d sqlDriver) lock() chan struct{} {
+	if !d.sqlite {
+		return nil
+	}
+	l, _ := sqliteLocks.LoadOrStore(d.db, make(chan struct{}, 1))
+	return l.(chan struct{})
+}
+
+// sqlConn is satisfied by *sql.DB and *sql.Tx; lock, if set, is held for each statement.
 type sqlConn struct {
 	c interface {
 		ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 		QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	}
+	lock chan struct{}
+}
+
+// acquire takes c.lock; call release when err is nil.
+func (c sqlConn) acquire(ctx context.Context) (release func(), err error) {
+	if c.lock == nil {
+		return func() {}, nil
+	}
+	select {
+	case c.lock <- struct{}{}:
+		return func() { <-c.lock }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (c sqlConn) Exec(ctx context.Context, query string, args ...any) (int64, error) {
+	release, err := c.acquire(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 	res, err := c.c.ExecContext(ctx, query, args...)
 	if err != nil {
 		return 0, err
@@ -575,6 +702,11 @@ func (c sqlConn) Exec(ctx context.Context, query string, args ...any) (int64, er
 }
 
 func (c sqlConn) Query(ctx context.Context, query string, args []any, row func(scan func(dest ...any) error) error) error {
+	release, err := c.acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
 	rows, err := c.c.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
