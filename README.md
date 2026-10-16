@@ -8,7 +8,7 @@ A small, persistent task queue for Go, backed by PostgreSQL or SQLite. A simple 
 - **Transactional.** Enqueue tasks in your own transaction. Run handlers inside a transaction that commits together with the task's removal.
 - **Multi-node.** Nodes coordinate through the database: `FOR UPDATE SKIP LOCKED` on Postgres, `UPDATE … RETURNING` on SQLite, and a version column for optimistic locking.
 - **Routing.** A node only picks up tasks whose names it has registered.
-- **Queues.** Tasks with the same queue name run one at a time, in the order they were enqueued.
+- **Queues.** Each executor runs one queue with its own worker pool.
 - **Schedules.** Recurring tasks that reschedule themselves after each successful run.
 - **Observable.** One hook receives every enqueue, start, completion, failure and retry.
 
@@ -26,7 +26,7 @@ Requires PostgreSQL, or SQLite 3.35 or later (for `RETURNING`).
 db, _ := sql.Open("pgx", dsn)
 db.SetMaxOpenConns(8 + 2) // workers + poll loop + heartbeat
 
-q := workq.New(db, workq.Postgres, 8, slog.Default())
+q := workq.NewPostgres(db, "", 8, slog.Default()) // "" = default queue
 if err := q.CreateTable(ctx); err != nil {
     log.Fatal(err)
 }
@@ -42,7 +42,7 @@ defer func() {
     q.Stop(sctx)
 }()
 
-id, err := q.Enqueue(ctx, db, workq.Task{Name: "send-email", Param: `{"to":"a@b.c"}`})
+id, err := q.Enqueue(ctx, workq.Task{Name: "send-email", Param: `{"to":"a@b.c"}`})
 ```
 
 ## Schema
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS workq_tasks (
   id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, -- SQLite: INTEGER PRIMARY KEY AUTOINCREMENT
   name       TEXT NOT NULL,
   param      TEXT NOT NULL,
-  queue      TEXT,
+  queue      TEXT NOT NULL DEFAULT '',
   scheduled  BOOLEAN NOT NULL DEFAULT FALSE,
   run_at     BIGINT NOT NULL,
   locked_at  BIGINT,
@@ -63,16 +63,16 @@ CREATE TABLE IF NOT EXISTS workq_tasks (
   failed_at  BIGINT,
   created_at BIGINT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS workq_tasks_due ON workq_tasks (run_at) WHERE failed_at IS NULL;
+CREATE INDEX IF NOT EXISTS workq_tasks_due ON workq_tasks (queue, run_at) WHERE failed_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS workq_tasks_scheduled ON workq_tasks (name) WHERE scheduled;
 ```
 
-- **IDs** are assigned by the database and only ever increase, so they define the order of tasks within a queue. On SQLite, `AUTOINCREMENT` ensures the IDs of deleted tasks are never reused.
+- **IDs** are assigned by the database. On SQLite, `AUTOINCREMENT` ensures the IDs of deleted tasks are never reused.
 - **Times** are stored as Unix milliseconds, which avoids timestamp differences between drivers.
 
 ## Registering tasks
 
-A task is a name plus a handler that takes a single string parameter. Return `nil` for success. A returned error, or a recovered panic, marks the task as failed.
+A task is a name plus a handler that takes a single string parameter. Return `nil` for success. A returned error, or a recovered panic, marks the task as failed. Registering a name twice panics.
 
 ```go
 q.Register("send-email", func(ctx context.Context, param string) error {
@@ -94,7 +94,7 @@ q.RegisterTx("charge-order", func(ctx context.Context, tx *sql.Tx, param string)
         return err
     }
     // Follow-up tasks commit together with the handler's writes
-    _, err := q.Enqueue(ctx, tx, workq.Task{Name: "send-email", Param: param})
+    _, err := q.EnqueueTx(ctx, tx, workq.Task{Name: "send-email", Param: param})
     return err
 })
 ```
@@ -103,15 +103,15 @@ The transaction stays open for the whole run. Use `Register` for slow work such 
 
 ## Enqueueing
 
-`Enqueue` accepts a `*sql.DB` or a `*sql.Tx` and returns the task's ID. Inside a transaction, the task exists only if your transaction commits.
+`Enqueue` returns the task's ID. `EnqueueTx` does the same inside your transaction, so the task exists only if your transaction commits.
 
 ```go
 tx, _ := db.BeginTx(ctx, nil)
 createOrder(tx, order)
-id, err := q.Enqueue(ctx, tx, workq.Task{
+id, err := q.EnqueueTx(ctx, tx, workq.Task{
     Name:  "send-email",
     Param: `{"to":"a@b.c"}`,
-    Queue: "user-42",                 // optional; see Queues
+    Queue: "mails",                   // optional; see Queues
     RunAt: time.Now().Add(time.Hour), // optional; defaults to now
 })
 tx.Commit()
@@ -119,7 +119,17 @@ tx.Commit()
 
 ## Queues
 
-Tasks that share a `Queue` value run one at a time, across all nodes, in ID order. Tasks enqueued one after another run in that order. Two transactions enqueueing to the same queue at the same moment can commit out of ID order. Tasks without a queue run in parallel. A failed task does not block its queue; the next task in that queue runs.
+An executor runs only the tasks of the queue passed to `NewPostgres`/`NewSQLite`; `""` is the default queue. Give each queue its own executor to size its worker pool independently:
+
+```go
+q := workq.NewPostgres(db, "", 8, log)
+mails := workq.NewPostgres(db, "mails", 1, log)
+mails.Register("send-email", send)
+
+q.Enqueue(ctx, workq.Task{Name: "send-email", Queue: "mails"})
+```
+
+There is no ordering guarantee. A queue with one worker runs one task at a time per node, but several nodes still run it in parallel.
 
 ## Scheduled tasks
 
@@ -145,7 +155,7 @@ q.Schedule("report", func(last time.Time) time.Time { // daily at 03:00
 })
 ```
 
-- A scheduled task is stored as one row per name, no matter how many nodes register it. A unique index enforces this. Its first run is `schedule(now)` at first registration. Restarts don't reset it.
+- A scheduled task is stored in the executor's queue, as one row per name, no matter how many nodes register it. A unique index enforces this. Its first run is `schedule(now)` at first registration. Restarts don't reset it.
 - After a successful run, the task is rescheduled to `schedule(finishTime)`.
 - A failed scheduled task stops until it is retried. After a retry it runs immediately, then returns to its schedule.
 - A schedule change in code takes effect after the task's next run.
@@ -160,8 +170,9 @@ for _, t := range failed {
     log.Printf("%d %s failed at %s: %s", t.ID, t.Name, t.FailedAt, t.Error)
 }
 
-ok, err := q.Retry(ctx, db, id)  // clears the failure; the task runs again
-ok, err = q.Delete(ctx, db, id)  // gives up on the task
+ok, err := q.Retry(ctx, id)  // clears the failure; the task runs again
+ok, err = q.Delete(ctx, id)  // gives up on the task
+// RetryTx and DeleteTx do the same inside your transaction
 ```
 
 There is no automatic retry. To add one, enqueue a delayed copy from the handler or from the `OnEvent` hook.
@@ -205,11 +216,11 @@ err := q.Stop(sctx)
 
 ## Testing
 
-`Wait` blocks until no pending or running tasks remain. Failed tasks don't count as pending.
+`Wait` blocks until no due or running tasks remain. Failed tasks and tasks scheduled for later don't count.
 
 ```go
 func TestSignup(t *testing.T) {
-    q := workq.New(db, workq.SQLite, 1, slog.Default())
+    q := workq.NewSQLite(db, "", 1, slog.Default())
     q.Register("send-email", fakeSend)
     q.Start(ctx)
     defer q.Stop(ctx)
@@ -228,8 +239,8 @@ func TestSignup(t *testing.T) {
 ## Configuration
 
 ```go
-q := workq.New(db, dialect, workers, logger)
-q.PollInterval = time.Second    // how often to look for due tasks
+q := workq.NewPostgres(db, queue, workers, logger) // or NewSQLite
+q.PollInterval = time.Second    // how often to look for due tasks (and how often Wait checks)
 q.LockTimeout = 5 * time.Minute // a lock older than this is treated as a dead node
 q.OnEvent = nil                 // event hook
 ```
@@ -238,21 +249,21 @@ Running tasks send a heartbeat every `LockTimeout / 3`.
 
 ## Database notes
 
-- **Postgres:** each running `RegisterTx` handler holds a connection. Set `db.SetMaxOpenConns` to at least `workers + 2`.
+- **Postgres:** each running `RegisterTx` handler holds a connection. Set `db.SetMaxOpenConns` to at least `workers + 2`, summed over all executors sharing the pool.
 - **SQLite:** set a `busy_timeout` (for example `_pragma=busy_timeout(5000)` with modernc.org/sqlite). SQLite has a single writer, so a `RegisterTx` handler that writes blocks other writers until it commits.
 
 ## How it works
 
-1. **Claiming:** every `PollInterval`, a node claims up to `free workers` due tasks with one statement:
+1. **Claiming:** every `PollInterval`, an executor claims up to `free workers` due tasks with one statement:
    - **Postgres:** `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED LIMIT n) RETURNING …`.
    - **SQLite:** the same statement without `SKIP LOCKED`. It is atomic because SQLite has only one writer.
 
    Claiming sets `locked_at` and increments `version`.
 2. **Eligibility:** a task can be claimed when all of these hold:
-   - its name is registered on this node
+   - it belongs to this executor's queue
+   - its name is registered on this executor
    - it is due
    - it hasn't failed
    - it is unlocked, or its lock is stale
-   - no older task in its queue is running
 3. **Heartbeat:** a heartbeat refreshes `locked_at` while the task runs.
 4. **Finishing:** every finishing write checks `WHERE id = ? AND version = ?`, so a node whose lock was taken over cannot overwrite the result.

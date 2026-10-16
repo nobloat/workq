@@ -1,0 +1,13 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: tests/go.sum
+      - run: go vet ./...
+      - run: cd tests && go test -race ./...
