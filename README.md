@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS workq_tasks (
   created_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS workq_tasks_due ON workq_tasks (queue, run_at, id) WHERE failed_at IS NULL;
+CREATE INDEX IF NOT EXISTS workq_tasks_due_name ON workq_tasks (queue, name, run_at, id) WHERE failed_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS workq_tasks_scheduled ON workq_tasks (name) WHERE scheduled;
 ```
 
@@ -173,7 +174,7 @@ q.Schedule("report", func(last time.Time) time.Time { // daily at 03:00
 })
 ```
 
-- A scheduled task is stored in the executor's queue, as one row per name, no matter how many nodes register it. A unique index enforces this. Its first run is `schedule(now)` at first registration. Restarts don't reset it.
+- A scheduled task is stored in the executor's queue, as one row per name, no matter how many nodes register it. A unique index enforces this. Its first run is `schedule(now)` at first registration. Restarts don't reset it. If `Start` can't create the row, the executor retries on every poll.
 - After a successful run, the task is rescheduled to `schedule(finishTime)`.
 - A failed scheduled task stops until it is retried. After a retry it runs immediately, then returns to its schedule.
 - A schedule change in code takes effect after the task's next run.
@@ -230,7 +231,7 @@ q.Start(ctx)
 err := q.Stop(sctx)
 ```
 
-`Stop` stops claiming new tasks and waits for running ones to finish. When `sctx` expires, the handlers' contexts are cancelled.
+`Stop` stops claiming new tasks and waits for running ones to finish. When `sctx` expires, the handlers' contexts are cancelled and `Stop` returns, even if a claim is stuck in the database.
 
 ## Testing
 
@@ -293,7 +294,7 @@ Machine: MacBook Pro (Mac15,10), Apple M3 Max (10 performance + 4 efficiency cor
 - **Postgres pays for round trips.** At p=1 every task waits for a claim and a delete round trip. Docker Desktop adds network overhead to each of them, so expect higher numbers with Postgres on a Linux host.
 - **`database/sql` and `pgxq` perform the same.** The driver isn't the bottleneck. Pick `pgxq` for `pgx.Tx` in handlers, not for speed. This only holds when `SetMaxIdleConns` matches `SetMaxOpenConns`; with the default of 2 idle connections, `database/sql` reached only about 2,000 tasks/s at p=64.
 - **Enqueue is one INSERT per task.** It is bounded by round trips on Postgres and by the single writer on SQLite. There is no bulk insert.
-- **Large backlogs don't slow it down.** In separate runs that worked through 1,000,000 tasks already inserted, the rate stayed level from the first task to the last: on Postgres about 30,000 tasks/s with 64 workers and about 66,000 with 2,000 workers, on SQLite about 70,000 with 64 workers. See [How it works](#how-it-works) for what keeps claims cheap.
+- **Large backlogs don't slow it down.** In separate runs that worked through 1,000,000 tasks already inserted, the rate stayed level from the first task to the last: on Postgres about 30,000 tasks/s with 64 workers and about 66,000 with 2,000 workers, on SQLite about 70,000 with 64 workers. See [How it works](#how-it-works) for what keeps claims cheap. These runs had one task name; with routing, `workq_tasks_due_name` keeps a node from scanning the due tasks of names it doesn't register.
 - **These are upper bounds.** Real tasks add their own run time, and with tasks that take milliseconds or more, the number of workers matters more than workq's overhead.
 
 ### Compared to River

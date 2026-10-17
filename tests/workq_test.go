@@ -9,9 +9,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -46,7 +48,9 @@ func startPostgres() (func(), error) {
 	if err := exec.Command("docker", "info").Run(); err != nil {
 		return nop, fmt.Errorf("docker not available: %w", err)
 	}
-	out, err := exec.Command("docker", "run", "-d", "--rm", "-e", "POSTGRES_PASSWORD=pw", "-p", "127.0.0.1::5432", "postgres:17-alpine").Output()
+	removeStaleContainers()
+	out, err := exec.Command("docker", "run", "-d", "--rm", "--label", "workq-test="+strconv.Itoa(os.Getpid()),
+		"-e", "POSTGRES_PASSWORD=pw", "-p", "127.0.0.1::5432", "postgres:17-alpine").Output()
 	if err != nil {
 		return nop, fmt.Errorf("docker run: %w", err)
 	}
@@ -78,6 +82,24 @@ func startPostgres() (func(), error) {
 }
 
 // env is one backend. db is always database/sql, for assertions; executors use the backend's own client.
+// removeStaleContainers removes containers of earlier runs whose process is gone, for example
+// after a -timeout panic, which skips TestMain's cleanup. Containers of running test processes stay.
+func removeStaleContainers() {
+	out, _ := exec.Command("docker", "ps", "-a", "--filter", "label=workq-test", "--format", `{{.ID}} {{.Label "workq-test"}}`).Output()
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		id, pid, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		if p, err := strconv.Atoi(pid); err == nil {
+			if err := syscall.Kill(p, 0); err == nil || errors.Is(err, syscall.EPERM) {
+				continue // still running
+			}
+		}
+		exec.Command("docker", "rm", "-f", "-v", id).Run()
+	}
+}
+
 type env[T any] struct {
 	db   *sql.DB
 	main node[T]
@@ -762,4 +784,181 @@ func testWorkersCap[T any](t *testing.T, e env[T]) {
 	if peak != 3 { // 3 proves both parallelism and the cap
 		t.Fatalf("peak concurrency %d, want 3", peak)
 	}
+}
+
+// faultDriver is a database/sql Driver for SQLite that calls hook before each statement on the pool;
+// a non-nil error fails the statement. hook may block to delay it.
+type faultDriver struct {
+	db   *sql.DB
+	hook func(query string) error
+}
+
+type faultConn struct {
+	c interface {
+		ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+		QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	}
+	hook func(query string) error
+}
+
+func (d faultDriver) DB() workq.Conn { return faultConn{d.db, d.hook} }
+func (d faultDriver) Tx(tx *sql.Tx) workq.Conn {
+	return faultConn{tx, func(string) error { return nil }}
+}
+func (d faultDriver) SQLite() bool                                 { return true }
+func (d faultDriver) Begin(ctx context.Context) (*sql.Tx, error)   { return d.db.BeginTx(ctx, nil) }
+func (d faultDriver) Commit(_ context.Context, tx *sql.Tx) error   { return tx.Commit() }
+func (d faultDriver) Rollback(_ context.Context, tx *sql.Tx) error { return tx.Rollback() }
+
+func (c faultConn) Exec(ctx context.Context, query string, args ...any) (int64, error) {
+	if err := c.hook(query); err != nil {
+		return 0, err
+	}
+	res, err := c.c.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (c faultConn) Query(ctx context.Context, query string, args []any, row func(scan func(dest ...any) error) error) error {
+	if err := c.hook(query); err != nil {
+		return err
+	}
+	rows, err := c.c.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err := row(rows.Scan); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// faultQueue returns a SQLite executor whose statements pass through hook.
+func faultQueue(e env[*sql.Tx], workers int, hook func(query string) error) *workq.Queue[*sql.Tx] {
+	q := workq.New[*sql.Tx](faultDriver{e.db, hook}, "", workers, slog.Default())
+	q.PollInterval = time.Second
+	return q
+}
+
+const (
+	claimQuery     = "SET locked_at = ?1, version"
+	heartbeatQuery = "SET locked_at = ?1 WHERE"
+)
+
+// The tests below run on SQLite only; channels must be made inside the synctest bubble.
+
+func TestStopTimeoutWithStuckClaim(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		stuck := make(chan struct{})
+		defer close(stuck)
+		var claims atomic.Int32
+		q := faultQueue(setupSQLite(t), 1, func(query string) error {
+			if strings.Contains(query, claimQuery) && claims.Add(1) > 1 {
+				<-stuck
+			}
+			return nil
+		})
+		q.Register("x", func(ctx context.Context, p string) error { return nil })
+		q.Start(t.Context())
+		for claims.Load() < 2 {
+			time.Sleep(time.Second)
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		if err := q.Stop(ctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestReclaimedOwnTaskKeepsWorkerCap(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		q := faultQueue(setupSQLite(t), 2, func(query string) error {
+			if strings.Contains(query, heartbeatQuery) {
+				return errors.New("heartbeat down")
+			}
+			return nil
+		})
+		q.LockTimeout = time.Minute
+		var mu sync.Mutex
+		active, peak := 0, 0
+		release := make(chan struct{})
+		q.Register("job", func(ctx context.Context, p string) error {
+			mu.Lock()
+			active++
+			peak = max(peak, active)
+			mu.Unlock()
+			<-release
+			mu.Lock()
+			active--
+			mu.Unlock()
+			return nil
+		})
+		start(t, q)
+		enqueue(t, q, workq.Task{Name: "job"})
+		time.Sleep(2 * time.Minute) // the lock went stale and this executor reclaimed its own task
+		enqueue(t, q, workq.Task{Name: "job"})
+		time.Sleep(time.Minute)
+		close(release)
+		wait(t, q)
+		if peak != 2 {
+			t.Fatalf("peak concurrency %d, want 2", peak)
+		}
+	})
+}
+
+func TestLateHeartbeatKeepsScheduleUnlocked(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := setupSQLite(t)
+		finished, resume := make(chan struct{}), make(chan struct{})
+		var first atomic.Bool
+		q := faultQueue(e, 1, func(query string) error {
+			if strings.Contains(query, heartbeatQuery) && first.CompareAndSwap(false, true) {
+				<-resume // snapshot taken while the task ran; the update runs after it finished
+			}
+			return nil
+		})
+		q.LockTimeout = 3 * time.Minute // heartbeat every minute
+		q.OnEvent = func(ev workq.Event) {
+			if ev.Type == workq.Completed {
+				close(finished)
+			}
+		}
+		q.Register("tick", func(ctx context.Context, p string) error { time.Sleep(90 * time.Second); return nil })
+		q.Schedule("tick", workq.Every(time.Hour))
+		start(t, q)
+		<-finished
+		close(resume)
+		time.Sleep(time.Second)
+		if count(t, e, "locked_at IS NOT NULL") != 0 {
+			t.Fatal("late heartbeat locked the rescheduled task")
+		}
+		wait(t, q)
+	})
+}
+
+func TestScheduleCreatedAfterStartFailure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := setupSQLite(t)
+		var inserts atomic.Int32
+		q := faultQueue(e, 1, func(query string) error {
+			if strings.HasPrefix(query, "INSERT") && strings.Contains(query, "scheduled") && inserts.Add(1) == 1 {
+				return errors.New("db down")
+			}
+			return nil
+		})
+		var runs atomic.Int32
+		q.Register("tick", func(ctx context.Context, p string) error { runs.Add(1); return nil })
+		q.Schedule("tick", workq.Every(time.Minute))
+		start(t, q)
+		time.Sleep(3 * time.Minute)
+		if count(t, e, "scheduled") != 1 || runs.Load() == 0 {
+			t.Fatalf("schedule rows=%d runs=%d", count(t, e, "scheduled"), runs.Load())
+		}
+	})
 }

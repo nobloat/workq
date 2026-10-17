@@ -87,7 +87,7 @@ type Queue[T any] struct {
 	schedules map[string]Schedule
 
 	mu         sync.Mutex
-	running    map[int64]int64 // id -> version
+	running    map[[2]int64]bool // id, version of each running execution; a task reclaimed by this executor runs twice
 	wg         sync.WaitGroup
 	wake       chan struct{}
 	loopCancel context.CancelFunc
@@ -130,6 +130,7 @@ const columns = `
   created_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS workq_tasks_due ON workq_tasks (queue, run_at, id) WHERE failed_at IS NULL;
+CREATE INDEX IF NOT EXISTS workq_tasks_due_name ON workq_tasks (queue, name, run_at, id) WHERE failed_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS workq_tasks_scheduled ON workq_tasks (name) WHERE scheduled;
 `
 
@@ -159,7 +160,7 @@ func New[T any](d Driver[T], queue string, workers int, log *slog.Logger) *Queue
 		log:          log,
 		handlers:     map[string]handler[T]{},
 		schedules:    map[string]Schedule{},
-		running:      map[int64]int64{},
+		running:      map[[2]int64]bool{},
 		wake:         make(chan struct{}, 1),
 	}
 }
@@ -202,20 +203,13 @@ func (q *Queue[T]) Schedule(name string, s Schedule) {
 }
 
 func (q *Queue[T]) Start(ctx context.Context) {
-	now := time.Now()
-	for name, s := range q.schedules {
-		_, err := q.db.Exec(ctx, q.rebind(`INSERT INTO workq_tasks (name, param, queue, scheduled, run_at, created_at)
-VALUES ($1, '', $2, TRUE, $3, $4) ON CONFLICT DO NOTHING`), name, q.queue, s(now).UnixMilli(), now.UnixMilli())
-		if err != nil {
-			q.log.Error("workq: create schedule", "name", name, "err", err)
-		}
-	}
+	pending := q.createSchedules(ctx, slices.Collect(maps.Keys(q.schedules)))
 	runCtx, runCancel := context.WithCancel(ctx)
 	loopCtx, loopCancel := context.WithCancel(runCtx)
 	q.runCancel, q.loopCancel = runCancel, loopCancel
 	q.loopDone, q.hbDone, q.finDone = make(chan struct{}), make(chan struct{}), make(chan struct{})
 	q.finishes = make(chan finishReq)
-	go q.poll(loopCtx, runCtx)
+	go q.poll(loopCtx, runCtx, pending)
 	go q.heartbeat(runCtx)
 	go q.finisher(runCtx)
 }
@@ -223,7 +217,12 @@ VALUES ($1, '', $2, TRUE, $3, $4) ON CONFLICT DO NOTHING`), name, q.queue, s(now
 // Stop stops claiming tasks and waits for running ones; handler contexts are cancelled when ctx expires.
 func (q *Queue[T]) Stop(ctx context.Context) error {
 	q.loopCancel()
-	<-q.loopDone
+	select {
+	case <-q.loopDone:
+	case <-ctx.Done(): // a claim is stuck in the database
+		q.runCancel()
+		return ctx.Err()
+	}
 	done := make(chan struct{})
 	go func() { q.wg.Wait(); close(done) }()
 	select {
@@ -319,23 +318,23 @@ const deleteSQL = `DELETE FROM workq_tasks WHERE id = $1`
 
 // Wait blocks until no due or running tasks with the given names remain (all tasks if none given).
 func (q *Queue[T]) Wait(ctx context.Context, names ...string) error {
-	query := `SELECT COUNT(*) FROM workq_tasks WHERE failed_at IS NULL AND (run_at <= $1 OR locked_at IS NOT NULL)`
+	query := `SELECT 1 FROM workq_tasks WHERE failed_at IS NULL AND (run_at <= $1 OR locked_at IS NOT NULL)`
 	args := []any{int64(0)}
 	if len(names) > 0 {
 		var ph string
 		args, ph = in(args, names)
 		query += ` AND name IN (` + ph + `)`
 	}
-	query = q.rebind(query)
+	query = q.rebind(query + ` LIMIT 1`) // stop at the first match instead of counting the backlog
 	tick := time.NewTicker(q.PollInterval)
 	defer tick.Stop()
 	for {
 		args[0] = time.Now().UnixMilli()
-		var n int64
-		if err := q.db.Query(ctx, query, args, func(scan func(...any) error) error { return scan(&n) }); err != nil {
+		pending := false
+		if err := q.db.Query(ctx, query, args, func(func(...any) error) error { pending = true; return nil }); err != nil {
 			return err
 		}
-		if n == 0 {
+		if !pending {
 			return nil
 		}
 		select {
@@ -346,7 +345,22 @@ func (q *Queue[T]) Wait(ctx context.Context, names ...string) error {
 	}
 }
 
-func (q *Queue[T]) poll(ctx, runCtx context.Context) {
+// createSchedules inserts the rows of the named schedules and returns the names that failed.
+func (q *Queue[T]) createSchedules(ctx context.Context, names []string) (failed []string) {
+	now := time.Now()
+	for _, name := range names {
+		_, err := q.db.Exec(ctx, q.rebind(`INSERT INTO workq_tasks (name, param, queue, scheduled, run_at, created_at)
+VALUES ($1, '', $2, TRUE, $3, $4) ON CONFLICT DO NOTHING`), name, q.queue, q.schedules[name](now).UnixMilli(), now.UnixMilli())
+		if err != nil {
+			q.log.Error("workq: create schedule", "name", name, "err", err)
+			failed = append(failed, name)
+		}
+	}
+	return failed
+}
+
+// poll claims tasks until ctx is cancelled and retries the schedules in pending that Start couldn't create.
+func (q *Queue[T]) poll(ctx, runCtx context.Context, pending []string) {
 	defer close(q.loopDone)
 	tick := time.NewTicker(q.PollInterval)
 	defer tick.Stop()
@@ -355,7 +369,14 @@ func (q *Queue[T]) poll(ctx, runCtx context.Context) {
 	// Ticks and short claims rescan from the start, picking up whatever lies behind the cursor.
 	var cursor *Task
 	for {
-		cursor = q.claim(context.WithoutCancel(ctx), runCtx, cursor) // a claim cancelled mid-flight would leave tasks locked until LockTimeout
+		if len(pending) > 0 {
+			pending = q.createSchedules(ctx, pending)
+		}
+		// A claim cancelled mid-flight would leave tasks locked until LockTimeout, so Stop doesn't cancel it.
+		// The timeout bounds a claim stuck in the database; its tasks are stale by then anyway.
+		claimCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), q.LockTimeout)
+		cursor = q.claim(claimCtx, runCtx, cursor)
+		cancel()
 		select {
 		case <-ctx.Done():
 			return
@@ -418,7 +439,7 @@ func (q *Queue[T]) claim(ctx, runCtx context.Context, cursor *Task) *Task {
 			last = &c.t // RETURNING has no order
 		}
 		q.mu.Lock()
-		q.running[c.t.ID] = c.version
+		q.running[[2]int64{c.t.ID, c.version}] = true
 		q.mu.Unlock()
 		q.wg.Add(1)
 		go q.run(runCtx, c.t, c.version, c.scheduled)
@@ -433,7 +454,7 @@ func (q *Queue[T]) run(ctx context.Context, t Task, version int64, scheduled boo
 	defer q.wg.Done()
 	defer func() {
 		q.mu.Lock()
-		delete(q.running, t.ID)
+		delete(q.running, [2]int64{t.ID, version})
 		q.mu.Unlock()
 		q.notify()
 	}()
@@ -535,14 +556,13 @@ func (q *Queue[T]) finisher(ctx context.Context) {
 				break more
 			}
 		}
-		var where []string
-		var args []any
-		for _, r := range batch {
-			args = append(args, r.id, r.version)
-			where = append(where, fmt.Sprintf("(id = $%d AND version = $%d)", len(args)-1, len(args)))
+		pairs := make([][2]int64, len(batch))
+		for i, r := range batch {
+			pairs[i] = [2]int64{r.id, r.version}
 		}
+		args, where := matchAny(nil, pairs)
 		deleted := map[int64]bool{}
-		err := q.db.Query(context.WithoutCancel(ctx), q.rebind(`DELETE FROM workq_tasks WHERE `+strings.Join(where, " OR ")+` RETURNING id`), args,
+		err := q.db.Query(context.WithoutCancel(ctx), q.rebind(`DELETE FROM workq_tasks WHERE `+where+` RETURNING id`), args,
 			func(scan func(...any) error) error {
 				var id int64
 				err := scan(&id)
@@ -566,15 +586,26 @@ func (q *Queue[T]) heartbeat(ctx context.Context) {
 		case <-tick.C:
 		}
 		q.mu.Lock()
-		running := maps.Clone(q.running)
+		pairs := slices.Collect(maps.Keys(q.running))
 		q.mu.Unlock()
-		now := time.Now().UnixMilli()
-		for id, version := range running {
-			if _, err := q.exec(ctx, q.db, `UPDATE workq_tasks SET locked_at = $1 WHERE id = $2 AND version = $3`, now, id, version); err != nil && ctx.Err() == nil {
-				q.log.Error("workq: heartbeat", "id", id, "err", err)
+		for chunk := range slices.Chunk(pairs, 100) {
+			args, where := matchAny([]any{time.Now().UnixMilli()}, chunk)
+			// locked_at IS NOT NULL: a heartbeat delayed past its task's finish must not lock the rescheduled row again
+			if _, err := q.exec(ctx, q.db, `UPDATE workq_tasks SET locked_at = $1 WHERE locked_at IS NOT NULL AND (`+where+`)`, args...); err != nil && ctx.Err() == nil {
+				q.log.Error("workq: heartbeat", "tasks", len(chunk), "err", err)
 			}
 		}
 	}
+}
+
+// matchAny appends id/version pairs to args and returns a condition matching any of them.
+func matchAny(args []any, pairs [][2]int64) ([]any, string) {
+	where := make([]string, len(pairs))
+	for i, p := range pairs {
+		args = append(args, p[0], p[1])
+		where[i] = fmt.Sprintf("(id = $%d AND version = $%d)", len(args)-1, len(args))
+	}
+	return args, strings.Join(where, " OR ")
 }
 
 func (q *Queue[T]) exec(ctx context.Context, db Conn, query string, args ...any) (bool, error) {
