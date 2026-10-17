@@ -1,10 +1,9 @@
-// Package workq is a persistent task queue backed by PostgreSQL or SQLite,
-// using only database/sql. Native pgx support lives in github.com/nobloat/workq/pgxq. See README.md.
 package workq
 
 import (
 	"context"
 	"database/sql"
+	_ "embed"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -15,24 +14,20 @@ import (
 	"time"
 )
 
-// Driver connects a Queue to a database client; T is its transaction type (*sql.Tx, pgx.Tx).
 type Driver[T any] interface {
-	DB() Conn     // the connection pool
-	Tx(tx T) Conn // a transaction
-	SQLite() bool // false for Postgres
+	DB() Conn
+	Tx(tx T) Conn
+	SQLite() bool
 	Begin(ctx context.Context) (T, error)
 	Commit(ctx context.Context, tx T) error
 	Rollback(ctx context.Context, tx T) error
 }
 
-// Conn runs queries written with $N placeholders.
 type Conn interface {
 	Exec(ctx context.Context, query string, args ...any) (rowsAffected int64, err error)
-	// Query calls row for each result row; scan reads its columns.
 	Query(ctx context.Context, query string, args []any, row func(scan func(dest ...any) error) error) error
 }
 
-// Schedule returns the next run time given the time of the last successful run.
 type Schedule func(lastSuccess time.Time) time.Time
 
 func Every(d time.Duration) Schedule {
@@ -63,13 +58,18 @@ const (
 type Event struct {
 	Type     EventType
 	Task     Task
-	Err      error         // Failed only
-	Duration time.Duration // Completed and Failed only
+	Err      error
+	Duration time.Duration
 }
 
 type handler[T any] struct {
-	fn   func(ctx context.Context, param string) error
-	txFn func(ctx context.Context, tx T, param string) error
+	fn       func(ctx context.Context, param string) error
+	txFn     func(ctx context.Context, tx T, param string) error
+	schedule Schedule
+}
+
+type execution struct {
+	id, version int64
 }
 
 type Queue[T any] struct {
@@ -77,74 +77,35 @@ type Queue[T any] struct {
 	LockTimeout  time.Duration
 	OnEvent      func(Event)
 
-	d         Driver[T]
-	db        Conn
-	sqlite    bool
-	queue     string
-	workers   int
-	log       *slog.Logger
-	handlers  map[string]handler[T]
-	schedules map[string]Schedule
+	d        Driver[T]
+	queue    string
+	workers  int
+	log      *slog.Logger
+	handlers map[string]handler[T]
 
 	mu         sync.Mutex
-	running    map[[2]int64]bool // id, version of each running execution; a task reclaimed by this executor runs twice
+	running    map[execution]struct{}
 	wg         sync.WaitGroup
-	wake       chan struct{}
 	loopCancel context.CancelFunc
 	runCancel  context.CancelFunc
 	loopDone   chan struct{}
 	hbDone     chan struct{}
-	finishes   chan finishReq
-	finDone    chan struct{}
 }
 
-// finishReq asks the finisher to delete a completed task.
-type finishReq struct {
-	id, version int64
-	res         chan finishRes
-}
+//go:embed schema_postgres.sql
+var schemaPostgres string
 
-type finishRes struct {
-	ok  bool
-	err error
-}
+//go:embed schema_sqlite.sql
+var schemaSQLite string
 
-// id orders tasks within a queue. SQLite needs AUTOINCREMENT so ids of deleted tasks are never reused.
-const (
-	schemaPostgres = `CREATE TABLE IF NOT EXISTS workq_tasks (
-  id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,` + columns
-	schemaSQLite = `CREATE TABLE IF NOT EXISTS workq_tasks (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,` + columns
-)
-
-const columns = `
-  name       TEXT NOT NULL,
-  param      TEXT NOT NULL,
-  queue      TEXT NOT NULL DEFAULT '',
-  scheduled  BOOLEAN NOT NULL DEFAULT FALSE,
-  run_at     BIGINT NOT NULL,
-  locked_at  BIGINT,
-  version    BIGINT NOT NULL DEFAULT 0,
-  error      TEXT,
-  failed_at  BIGINT,
-  created_at BIGINT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS workq_tasks_due ON workq_tasks (queue, run_at, id) WHERE failed_at IS NULL;
-CREATE INDEX IF NOT EXISTS workq_tasks_due_name ON workq_tasks (queue, name, run_at, id) WHERE failed_at IS NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS workq_tasks_scheduled ON workq_tasks (name) WHERE scheduled;
-`
-
-// NewPostgres returns an executor that runs tasks of the given queue ("" is the default queue) with its own worker pool.
 func NewPostgres(db *sql.DB, queue string, workers int, log *slog.Logger) *Queue[*sql.Tx] {
 	return New[*sql.Tx](sqlDriver{db, false}, queue, workers, log)
 }
 
-// NewSQLite is NewPostgres for SQLite 3.35 or later.
 func NewSQLite(db *sql.DB, queue string, workers int, log *slog.Logger) *Queue[*sql.Tx] {
 	return New[*sql.Tx](sqlDriver{db, true}, queue, workers, log)
 }
 
-// New is NewPostgres for any Driver.
 func New[T any](d Driver[T], queue string, workers int, log *slog.Logger) *Queue[T] {
 	if log == nil {
 		log = slog.Default()
@@ -153,73 +114,79 @@ func New[T any](d Driver[T], queue string, workers int, log *slog.Logger) *Queue
 		PollInterval: time.Second,
 		LockTimeout:  5 * time.Minute,
 		d:            d,
-		db:           d.DB(),
-		sqlite:       d.SQLite(),
 		queue:        queue,
 		workers:      workers,
 		log:          log,
 		handlers:     map[string]handler[T]{},
-		schedules:    map[string]Schedule{},
-		running:      map[[2]int64]bool{},
-		wake:         make(chan struct{}, 1),
+		running:      map[execution]struct{}{},
 	}
 }
 
 func (q *Queue[T]) CreateTable(ctx context.Context) error {
 	schema := schemaPostgres
-	if q.sqlite {
+	if q.d.SQLite() {
 		schema = schemaSQLite
 	}
-	_, err := q.db.Exec(ctx, schema)
+	_, err := q.d.DB().Exec(ctx, schema)
 	return err
 }
 
-// Register panics if name is already registered.
-func (q *Queue[T]) Register(name string, fn func(ctx context.Context, param string) error) {
-	q.register(name, handler[T]{fn: fn})
+func (q *Queue[T]) Register(name string, fn func(ctx context.Context, param string) error) error {
+	return q.register(name, handler[T]{fn: fn})
 }
 
-// RegisterTx panics if name is already registered.
-func (q *Queue[T]) RegisterTx(name string, fn func(ctx context.Context, tx T, param string) error) {
-	q.register(name, handler[T]{txFn: fn})
+func (q *Queue[T]) RegisterTx(name string, fn func(ctx context.Context, tx T, param string) error) error {
+	return q.register(name, handler[T]{txFn: fn})
 }
 
-func (q *Queue[T]) register(name string, h handler[T]) {
+func (q *Queue[T]) register(name string, h handler[T]) error {
 	if _, ok := q.handlers[name]; ok {
-		panic("workq: task already registered: " + name)
+		return fmt.Errorf("workq: task already registered: %s", name)
 	}
 	q.handlers[name] = h
+	return nil
 }
 
-// Schedule attaches s to the already registered task name.
-func (q *Queue[T]) Schedule(name string, s Schedule) {
-	if _, ok := q.handlers[name]; !ok {
-		panic("workq: Schedule called before Register for " + name)
+func (q *Queue[T]) Schedule(name string, s Schedule) error {
+	h, ok := q.handlers[name]
+	if !ok {
+		return fmt.Errorf("workq: Schedule called before Register for %s", name)
 	}
-	if _, ok := q.schedules[name]; ok {
-		panic("workq: schedule already registered: " + name)
+	if h.schedule != nil {
+		return fmt.Errorf("workq: schedule already registered: %s", name)
 	}
-	q.schedules[name] = s
+	if s == nil {
+		return fmt.Errorf("workq: nil schedule for %s", name)
+	}
+	h.schedule = s
+	q.handlers[name] = h
+	return nil
 }
 
-func (q *Queue[T]) Start(ctx context.Context) {
-	pending := q.createSchedules(ctx, slices.Collect(maps.Keys(q.schedules)))
+func (q *Queue[T]) Start(ctx context.Context) error {
+	var scheduled []string
+	for name, h := range q.handlers {
+		if h.schedule != nil {
+			scheduled = append(scheduled, name)
+		}
+	}
+	if err := q.createSchedules(ctx, scheduled); err != nil {
+		return err
+	}
 	runCtx, runCancel := context.WithCancel(ctx)
 	loopCtx, loopCancel := context.WithCancel(runCtx)
 	q.runCancel, q.loopCancel = runCancel, loopCancel
-	q.loopDone, q.hbDone, q.finDone = make(chan struct{}), make(chan struct{}), make(chan struct{})
-	q.finishes = make(chan finishReq)
-	go q.poll(loopCtx, runCtx, pending)
+	q.loopDone, q.hbDone = make(chan struct{}), make(chan struct{})
+	go q.poll(loopCtx, runCtx)
 	go q.heartbeat(runCtx)
-	go q.finisher(runCtx)
+	return nil
 }
 
-// Stop stops claiming tasks and waits for running ones; handler contexts are cancelled when ctx expires.
 func (q *Queue[T]) Stop(ctx context.Context) error {
 	q.loopCancel()
 	select {
 	case <-q.loopDone:
-	case <-ctx.Done(): // a claim is stuck in the database
+	case <-ctx.Done():
 		q.runCancel()
 		return ctx.Err()
 	}
@@ -229,7 +196,6 @@ func (q *Queue[T]) Stop(ctx context.Context) error {
 	case <-done:
 		q.runCancel()
 		<-q.hbDone
-		<-q.finDone
 		return nil
 	case <-ctx.Done():
 		q.runCancel()
@@ -237,12 +203,10 @@ func (q *Queue[T]) Stop(ctx context.Context) error {
 	}
 }
 
-// Enqueue inserts t and returns its id; t.ID is ignored.
 func (q *Queue[T]) Enqueue(ctx context.Context, t Task) (int64, error) {
-	return q.enqueue(ctx, q.db, t)
+	return q.enqueue(ctx, q.d.DB(), t)
 }
 
-// EnqueueTx is Enqueue inside tx: the task exists only if tx commits.
 func (q *Queue[T]) EnqueueTx(ctx context.Context, tx T, t Task) (int64, error) {
 	return q.enqueue(ctx, q.d.Tx(tx), t)
 }
@@ -253,7 +217,7 @@ func (q *Queue[T]) enqueue(ctx context.Context, db Conn, t Task) (int64, error) 
 		t.RunAt = t.CreatedAt
 	}
 	t.RunAt = time.UnixMilli(t.RunAt.UnixMilli())
-	err := db.Query(ctx, q.rebind(`INSERT INTO workq_tasks (name, param, queue, run_at, created_at)
+	err := db.Query(ctx, rebind(q.d.SQLite(), `INSERT INTO workq (name, param, queue, run_at, created_at)
 VALUES ($1, $2, $3, $4, $5) RETURNING id`),
 		[]any{t.Name, t.Param, t.Queue, t.RunAt.UnixMilli(), t.CreatedAt.UnixMilli()},
 		func(scan func(...any) error) error { return scan(&t.ID) })
@@ -261,13 +225,12 @@ VALUES ($1, $2, $3, $4, $5) RETURNING id`),
 		return 0, err
 	}
 	q.emit(Event{Type: Enqueued, Task: t})
-	q.notify()
 	return t.ID, nil
 }
 
 func (q *Queue[T]) Failed(ctx context.Context) ([]Task, error) {
 	var tasks []Task
-	err := q.db.Query(ctx, `SELECT `+taskCols+` FROM workq_tasks WHERE failed_at IS NOT NULL ORDER BY id`, nil,
+	err := q.d.DB().Query(ctx, `SELECT `+taskCols+` FROM workq WHERE failed_at IS NOT NULL ORDER BY id`, nil,
 		func(scan func(...any) error) error {
 			t, err := scanTask(scan)
 			tasks = append(tasks, t)
@@ -276,12 +239,10 @@ func (q *Queue[T]) Failed(ctx context.Context) ([]Task, error) {
 	return tasks, err
 }
 
-// Retry clears the failure of task id so it runs again; false if it isn't failed.
 func (q *Queue[T]) Retry(ctx context.Context, id int64) (bool, error) {
-	return q.retry(ctx, q.db, id)
+	return q.retry(ctx, q.d.DB(), id)
 }
 
-// RetryTx is Retry inside tx.
 func (q *Queue[T]) RetryTx(ctx context.Context, tx T, id int64) (bool, error) {
 	return q.retry(ctx, q.d.Tx(tx), id)
 }
@@ -289,7 +250,7 @@ func (q *Queue[T]) RetryTx(ctx context.Context, tx T, id int64) (bool, error) {
 func (q *Queue[T]) retry(ctx context.Context, db Conn, id int64) (bool, error) {
 	var t Task
 	found := false
-	err := db.Query(ctx, q.rebind(`UPDATE workq_tasks SET error = NULL, failed_at = NULL, locked_at = NULL, run_at = $1
+	err := db.Query(ctx, rebind(q.d.SQLite(), `UPDATE workq SET error = NULL, failed_at = NULL, locked_at = NULL, run_at = $1
 WHERE id = $2 AND failed_at IS NOT NULL RETURNING `+taskCols), []any{time.Now().UnixMilli(), id},
 		func(scan func(...any) error) (err error) {
 			t, err = scanTask(scan)
@@ -300,38 +261,34 @@ WHERE id = $2 AND failed_at IS NOT NULL RETURNING `+taskCols), []any{time.Now().
 		return false, err
 	}
 	q.emit(Event{Type: Retried, Task: t})
-	q.notify()
 	return true, nil
 }
 
-// Delete removes task id; false if it doesn't exist.
 func (q *Queue[T]) Delete(ctx context.Context, id int64) (bool, error) {
-	return q.exec(ctx, q.db, deleteSQL, id)
+	return q.exec(ctx, q.d.DB(), deleteSQL, id)
 }
 
-// DeleteTx is Delete inside tx.
 func (q *Queue[T]) DeleteTx(ctx context.Context, tx T, id int64) (bool, error) {
 	return q.exec(ctx, q.d.Tx(tx), deleteSQL, id)
 }
 
-const deleteSQL = `DELETE FROM workq_tasks WHERE id = $1`
+const deleteSQL = `DELETE FROM workq WHERE id = $1`
 
-// Wait blocks until no due or running tasks with the given names remain (all tasks if none given).
 func (q *Queue[T]) Wait(ctx context.Context, names ...string) error {
-	query := `SELECT 1 FROM workq_tasks WHERE failed_at IS NULL AND (run_at <= $1 OR locked_at IS NOT NULL)`
+	query := `SELECT 1 FROM workq WHERE failed_at IS NULL AND (run_at <= $1 OR locked_at IS NOT NULL)`
 	args := []any{int64(0)}
 	if len(names) > 0 {
 		var ph string
 		args, ph = in(args, names)
 		query += ` AND name IN (` + ph + `)`
 	}
-	query = q.rebind(query + ` LIMIT 1`) // stop at the first match instead of counting the backlog
+	query = rebind(q.d.SQLite(), query+` LIMIT 1`)
 	tick := time.NewTicker(q.PollInterval)
 	defer tick.Stop()
 	for {
 		args[0] = time.Now().UnixMilli()
 		pending := false
-		if err := q.db.Query(ctx, query, args, func(func(...any) error) error { pending = true; return nil }); err != nil {
+		if err := q.d.DB().Query(ctx, query, args, func(func(...any) error) error { pending = true; return nil }); err != nil {
 			return err
 		}
 		if !pending {
@@ -345,35 +302,33 @@ func (q *Queue[T]) Wait(ctx context.Context, names ...string) error {
 	}
 }
 
-// createSchedules inserts the rows of the named schedules and returns the names that failed.
-func (q *Queue[T]) createSchedules(ctx context.Context, names []string) (failed []string) {
+func (q *Queue[T]) createSchedules(ctx context.Context, names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	tx, err := q.d.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer q.d.Rollback(ctx, tx)
+	db := q.d.Tx(tx)
 	now := time.Now()
 	for _, name := range names {
-		_, err := q.db.Exec(ctx, q.rebind(`INSERT INTO workq_tasks (name, param, queue, scheduled, run_at, created_at)
-VALUES ($1, '', $2, TRUE, $3, $4) ON CONFLICT DO NOTHING`), name, q.queue, q.schedules[name](now).UnixMilli(), now.UnixMilli())
+		_, err := db.Exec(ctx, rebind(q.d.SQLite(), `INSERT INTO workq (name, param, queue, scheduled, run_at, created_at)
+VALUES ($1, '', $2, TRUE, $3, $4) ON CONFLICT DO NOTHING`), name, q.queue, q.handlers[name].schedule(now).UnixMilli(), now.UnixMilli())
 		if err != nil {
-			q.log.Error("workq: create schedule", "name", name, "err", err)
-			failed = append(failed, name)
+			return fmt.Errorf("workq: create schedule %q: %w", name, err)
 		}
 	}
-	return failed
+	return q.d.Commit(ctx, tx)
 }
 
-// poll claims tasks until ctx is cancelled and retries the schedules in pending that Start couldn't create.
-func (q *Queue[T]) poll(ctx, runCtx context.Context, pending []string) {
+func (q *Queue[T]) poll(ctx, runCtx context.Context) {
 	defer close(q.loopDone)
 	tick := time.NewTicker(q.PollInterval)
 	defer tick.Stop()
-	// cursor is where the last claim stopped. Continuing from it skips index entries of deleted tasks,
-	// which on Postgres stay until vacuum and would otherwise be read again by every claim.
-	// Ticks and short claims rescan from the start, picking up whatever lies behind the cursor.
 	var cursor *Task
 	for {
-		if len(pending) > 0 {
-			pending = q.createSchedules(ctx, pending)
-		}
-		// A claim cancelled mid-flight would leave tasks locked until LockTimeout, so Stop doesn't cancel it.
-		// The timeout bounds a claim stuck in the database; its tasks are stale by then anyway.
 		claimCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), q.LockTimeout)
 		cursor = q.claim(claimCtx, runCtx, cursor)
 		cancel()
@@ -382,24 +337,19 @@ func (q *Queue[T]) poll(ctx, runCtx context.Context, pending []string) {
 			return
 		case <-tick.C:
 			cursor = nil
-		case <-q.wake:
 		}
 	}
 }
 
-// claimSQL picks due, unfailed, unlocked (or stale) tasks of this queue.
-// Postgres uses id = ANY(ARRAY(…)): with id IN (…) the planner estimates a join by reading the lowest
-// ids from the primary key, where deleted tasks leave dead entries until vacuum (1–2 ms per claim at 1M tasks).
-const claimSQL = `UPDATE workq_tasks SET locked_at = $1, version = version + 1
+const claimSQL = `UPDATE workq SET locked_at = $1, version = version + 1
 WHERE id %s (
-  SELECT id FROM workq_tasks t
+  SELECT id FROM workq t
   WHERE t.failed_at IS NULL AND t.run_at <= $1
     AND (t.locked_at IS NULL OR t.locked_at < $2)
     AND t.queue = $4 AND (t.run_at, t.id) > ($5, $6) AND t.name IN (%s)
   ORDER BY t.run_at, t.id LIMIT $3%s)%s
 RETURNING ` + taskCols + `, version, scheduled`
 
-// claim claims up to free tasks after cursor (from the start if nil) and returns the cursor for the next claim.
 func (q *Queue[T]) claim(ctx, runCtx context.Context, cursor *Task) *Task {
 	q.mu.Lock()
 	free := q.workers - len(q.running)
@@ -414,7 +364,7 @@ func (q *Queue[T]) claim(ctx, runCtx context.Context, cursor *Task) *Task {
 	}
 	args, ph := in(append([]any{now, now - q.LockTimeout.Milliseconds(), free, q.queue}, after...), slices.Collect(maps.Keys(q.handlers)))
 	op, lock, end := "IN", "", ""
-	if !q.sqlite {
+	if !q.d.SQLite() {
 		op, lock, end = "= ANY(ARRAY", " FOR UPDATE SKIP LOCKED", ")"
 	}
 	type claimed struct {
@@ -422,30 +372,29 @@ func (q *Queue[T]) claim(ctx, runCtx context.Context, cursor *Task) *Task {
 		version   int64
 		scheduled bool
 	}
-	var cs []claimed
-	err := q.db.Query(ctx, q.rebind(fmt.Sprintf(claimSQL, op, ph, lock, end)), args, func(scan func(...any) error) (err error) {
+	var claimedTasks []claimed
+	err := q.d.DB().Query(ctx, rebind(q.d.SQLite(), fmt.Sprintf(claimSQL, op, ph, lock, end)), args, func(scan func(...any) error) (err error) {
 		var c claimed
 		c.t, err = scanTask(scan, &c.version, &c.scheduled)
-		cs = append(cs, c)
+		claimedTasks = append(claimedTasks, c)
 		return err
 	})
 	if err != nil {
 		q.log.Error("workq: claim", "err", err)
 	}
-	// Workers start only after the result is closed: on SQLite an open result holds the write lock.
 	var last *Task
-	for _, c := range cs {
+	for _, c := range claimedTasks {
 		if last == nil || c.t.RunAt.After(last.RunAt) || c.t.RunAt.Equal(last.RunAt) && c.t.ID > last.ID {
-			last = &c.t // RETURNING has no order
+			last = &c.t
 		}
 		q.mu.Lock()
-		q.running[[2]int64{c.t.ID, c.version}] = true
+		q.running[execution{c.t.ID, c.version}] = struct{}{}
 		q.mu.Unlock()
 		q.wg.Add(1)
 		go q.run(runCtx, c.t, c.version, c.scheduled)
 	}
-	if len(cs) < free {
-		return nil // nothing more after the cursor; rescan from the start next time
+	if len(claimedTasks) < free {
+		return nil
 	}
 	return last
 }
@@ -454,37 +403,32 @@ func (q *Queue[T]) run(ctx context.Context, t Task, version int64, scheduled boo
 	defer q.wg.Done()
 	defer func() {
 		q.mu.Lock()
-		delete(q.running, [2]int64{t.ID, version})
+		delete(q.running, execution{t.ID, version})
 		q.mu.Unlock()
-		q.notify()
 	}()
 	q.emit(Event{Type: Started, Task: t})
 	start := time.Now()
-	dbCtx := context.WithoutCancel(ctx) // finishing writes must happen even after the handler was cancelled
+	dbCtx := context.WithoutCancel(ctx)
 	h := q.handlers[t.Name]
 	var s Schedule
 	if scheduled {
-		s = q.schedules[t.Name]
+		s = h.schedule
 	}
-	var herr, err error
+	var handlerErr, err error
 	ok := false
 	switch {
 	case scheduled && s == nil:
-		herr = fmt.Errorf("workq: %q is scheduled but has no schedule on this node", t.Name)
+		handlerErr = fmt.Errorf("workq: %q is scheduled but has no schedule on this node", t.Name)
 	case h.txFn != nil:
-		herr, ok, err = q.runTx(ctx, dbCtx, h.txFn, t, version, s)
+		handlerErr, ok, err = q.runTx(ctx, dbCtx, h.txFn, t, version, s)
 	default:
-		if herr = protect(func() error { return h.fn(ctx, t.Param) }); herr == nil {
-			if s == nil {
-				ok, err = q.finish(ctx, t.ID, version)
-			} else {
-				ok, err = q.done(dbCtx, q.db, t.ID, version, s)
-			}
+		if handlerErr = protect(func() error { return h.fn(ctx, t.Param) }); handlerErr == nil {
+			ok, err = q.complete(dbCtx, q.d.DB(), t.ID, version, s)
 		}
 	}
-	if herr != nil {
-		t.Error, t.FailedAt = herr.Error(), time.UnixMilli(time.Now().UnixMilli())
-		ok, err = q.exec(dbCtx, q.db, `UPDATE workq_tasks SET error = $1, failed_at = $2, locked_at = NULL WHERE id = $3 AND version = $4`,
+	if handlerErr != nil {
+		t.Error, t.FailedAt = handlerErr.Error(), time.UnixMilli(time.Now().UnixMilli())
+		ok, err = q.exec(dbCtx, q.d.DB(), `UPDATE workq SET error = $1, failed_at = $2, locked_at = NULL WHERE id = $3 AND version = $4`,
 			t.Error, t.FailedAt.UnixMilli(), t.ID, version)
 	}
 	switch {
@@ -492,87 +436,34 @@ func (q *Queue[T]) run(ctx context.Context, t Task, version int64, scheduled boo
 		q.log.Error("workq: finish task", "id", t.ID, "name", t.Name, "err", err)
 	case !ok:
 		q.log.Warn("workq: lost lock, result discarded", "id", t.ID, "name", t.Name)
-	case herr != nil:
-		q.emit(Event{Type: Failed, Task: t, Err: herr, Duration: time.Since(start)})
+	case handlerErr != nil:
+		q.emit(Event{Type: Failed, Task: t, Err: handlerErr, Duration: time.Since(start)})
 	default:
 		q.emit(Event{Type: Completed, Task: t, Duration: time.Since(start)})
 	}
 }
 
-func (q *Queue[T]) runTx(ctx, dbCtx context.Context, fn func(context.Context, T, string) error, t Task, version int64, s Schedule) (herr error, ok bool, err error) {
+func (q *Queue[T]) runTx(ctx, dbCtx context.Context, fn func(context.Context, T, string) error, t Task, version int64, s Schedule) (handlerErr error, ok bool, err error) {
 	tx, err := q.d.Begin(dbCtx)
 	if err != nil {
 		return nil, false, err
 	}
-	defer q.d.Rollback(dbCtx, tx) // no-op after Commit
-	if herr = protect(func() error { return fn(ctx, tx, t.Param) }); herr != nil {
-		return herr, false, nil
+	defer q.d.Rollback(dbCtx, tx)
+	if handlerErr = protect(func() error { return fn(ctx, tx, t.Param) }); handlerErr != nil {
+		return handlerErr, false, nil
 	}
-	if ok, err = q.done(dbCtx, q.d.Tx(tx), t.ID, version, s); !ok || err != nil {
+	if ok, err = q.complete(dbCtx, q.d.Tx(tx), t.ID, version, s); !ok || err != nil {
 		return nil, ok, err
 	}
 	return nil, true, q.d.Commit(dbCtx, tx)
 }
 
-// done removes a finished task, or reschedules it when s is set.
-func (q *Queue[T]) done(ctx context.Context, db Conn, id, version int64, s Schedule) (bool, error) {
+func (q *Queue[T]) complete(ctx context.Context, db Conn, id, version int64, s Schedule) (bool, error) {
 	if s == nil {
-		return q.exec(ctx, db, `DELETE FROM workq_tasks WHERE id = $1 AND version = $2`, id, version)
+		return q.exec(ctx, db, `DELETE FROM workq WHERE id = $1 AND version = $2`, id, version)
 	}
-	return q.exec(ctx, db, `UPDATE workq_tasks SET run_at = $1, locked_at = NULL WHERE id = $2 AND version = $3`,
+	return q.exec(ctx, db, `UPDATE workq SET run_at = $1, locked_at = NULL WHERE id = $2 AND version = $3`,
 		s(time.Now()).UnixMilli(), id, version)
-}
-
-// finish deletes a completed task through the finisher, which batches concurrent deletes into one statement.
-func (q *Queue[T]) finish(ctx context.Context, id, version int64) (bool, error) {
-	r := finishReq{id, version, make(chan finishRes, 1)}
-	select {
-	case q.finishes <- r:
-		res := <-r.res
-		return res.ok, res.err
-	case <-ctx.Done(): // Stop timed out and the finisher is gone
-		return q.done(context.WithoutCancel(ctx), q.db, id, version, nil)
-	}
-}
-
-// finisher deletes whatever completed while the previous batch ran: one task under light load,
-// many under heavy load, without waiting for a batch to fill.
-func (q *Queue[T]) finisher(ctx context.Context) {
-	defer close(q.finDone)
-	for {
-		var batch []finishReq
-		select {
-		case <-ctx.Done():
-			return
-		case r := <-q.finishes:
-			batch = append(batch, r)
-		}
-	more:
-		for len(batch) < 100 {
-			select {
-			case r := <-q.finishes:
-				batch = append(batch, r)
-			default:
-				break more
-			}
-		}
-		pairs := make([][2]int64, len(batch))
-		for i, r := range batch {
-			pairs[i] = [2]int64{r.id, r.version}
-		}
-		args, where := matchAny(nil, pairs)
-		deleted := map[int64]bool{}
-		err := q.db.Query(context.WithoutCancel(ctx), q.rebind(`DELETE FROM workq_tasks WHERE `+where+` RETURNING id`), args,
-			func(scan func(...any) error) error {
-				var id int64
-				err := scan(&id)
-				deleted[id] = true
-				return err
-			})
-		for _, r := range batch {
-			r.res <- finishRes{deleted[r.id], err}
-		}
-	}
 }
 
 func (q *Queue[T]) heartbeat(ctx context.Context) {
@@ -590,32 +481,29 @@ func (q *Queue[T]) heartbeat(ctx context.Context) {
 		q.mu.Unlock()
 		for chunk := range slices.Chunk(pairs, 100) {
 			args, where := matchAny([]any{time.Now().UnixMilli()}, chunk)
-			// locked_at IS NOT NULL: a heartbeat delayed past its task's finish must not lock the rescheduled row again
-			if _, err := q.exec(ctx, q.db, `UPDATE workq_tasks SET locked_at = $1 WHERE locked_at IS NOT NULL AND (`+where+`)`, args...); err != nil && ctx.Err() == nil {
+			if _, err := q.exec(ctx, q.d.DB(), `UPDATE workq SET locked_at = $1 WHERE locked_at IS NOT NULL AND (`+where+`)`, args...); err != nil && ctx.Err() == nil {
 				q.log.Error("workq: heartbeat", "tasks", len(chunk), "err", err)
 			}
 		}
 	}
 }
 
-// matchAny appends id/version pairs to args and returns a condition matching any of them.
-func matchAny(args []any, pairs [][2]int64) ([]any, string) {
+func matchAny(args []any, pairs []execution) ([]any, string) {
 	where := make([]string, len(pairs))
 	for i, p := range pairs {
-		args = append(args, p[0], p[1])
+		args = append(args, p.id, p.version)
 		where[i] = fmt.Sprintf("(id = $%d AND version = $%d)", len(args)-1, len(args))
 	}
 	return args, strings.Join(where, " OR ")
 }
 
 func (q *Queue[T]) exec(ctx context.Context, db Conn, query string, args ...any) (bool, error) {
-	n, err := db.Exec(ctx, q.rebind(query), args...)
+	n, err := db.Exec(ctx, rebind(q.d.SQLite(), query), args...)
 	return n > 0, err
 }
 
-// rebind turns $N into SQLite's ?N, so both databases share one query text.
-func (q *Queue[T]) rebind(query string) string {
-	if q.sqlite {
+func rebind(sqlite bool, query string) string {
+	if sqlite {
 		return strings.ReplaceAll(query, "$", "?")
 	}
 	return query
@@ -627,15 +515,6 @@ func (q *Queue[T]) emit(e Event) {
 	}
 }
 
-// notify wakes the poll loop without blocking.
-func (q *Queue[T]) notify() {
-	select {
-	case q.wake <- struct{}{}:
-	default:
-	}
-}
-
-// in appends names to args and returns their placeholders.
 func in(args []any, names []string) ([]any, string) {
 	ph := make([]string, len(names))
 	for i, n := range names {
@@ -670,7 +549,6 @@ func scanTask(scan func(...any) error, extra ...any) (Task, error) {
 	return t, err
 }
 
-// sqlDriver is the Driver for database/sql.
 type sqlDriver struct {
 	db     *sql.DB
 	sqlite bool
@@ -683,11 +561,7 @@ func (d sqlDriver) Begin(ctx context.Context) (*sql.Tx, error)   { return d.db.B
 func (d sqlDriver) Commit(_ context.Context, tx *sql.Tx) error   { return tx.Commit() }
 func (d sqlDriver) Rollback(_ context.Context, tx *sql.Tx) error { return tx.Rollback() }
 
-// sqliteLocks holds one lock per SQLite *sql.DB. SQLite has a single writer: goroutines that
-// race for it lose to SQLITE_BUSY and sleep in the busy handler, while waiting for this lock is
-// instant. It serializes the statements of all executors on that *sql.DB in this process.
-// ponytail: entries live as long as the process; fine for the few DBs an app opens.
-var sqliteLocks sync.Map // *sql.DB -> chan struct{} with capacity 1
+var sqliteLocks sync.Map
 
 func (d sqlDriver) lock() chan struct{} {
 	if !d.sqlite {
@@ -697,7 +571,6 @@ func (d sqlDriver) lock() chan struct{} {
 	return l.(chan struct{})
 }
 
-// sqlConn is satisfied by *sql.DB and *sql.Tx; lock, if set, is held for each statement.
 type sqlConn struct {
 	c interface {
 		ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
@@ -706,7 +579,6 @@ type sqlConn struct {
 	lock chan struct{}
 }
 
-// acquire takes c.lock; call release when err is nil.
 func (c sqlConn) acquire(ctx context.Context) (release func(), err error) {
 	if c.lock == nil {
 		return func() {}, nil

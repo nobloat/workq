@@ -25,7 +25,7 @@ Assumed load: multiple executors, routed task names, long-running handlers, and 
 - **Fix:** Observe `ctx.Done()` while waiting for the poll loop, cancel the run context on expiry, and return the context error. Bound database operations too; do not solve this by waiting for workers while the poller can still add them.
 - **If we skip it:** The documented 30-second shutdown can hang until an external lock or database problem clears, leaving handlers uncancelled past the deadline.
 
-**Verified:** With the unmodified `NewPostgres` driver, held `LOCK TABLE workq_tasks IN ACCESS EXCLUSIVE MODE` in a separate transaction, started a queue with a registered handler, and checked `pg_stat_activity` to confirm its claim was waiting on a lock. Called `Stop` with a 30 ms timeout: it was still blocked 100 ms after the deadline and returned only after the transaction released the table lock. A separate blocked-driver test confirmed the same control-flow defect.
+**Verified:** With the unmodified `NewPostgres` driver, held `LOCK TABLE workq IN ACCESS EXCLUSIVE MODE` in a separate transaction, started a queue with a registered handler, and checked `pg_stat_activity` to confirm its claim was waiting on a lock. Called `Stop` with a 30 ms timeout: it was still blocked 100 ms after the deadline and returned only after the transaction released the table lock. A separate blocked-driver test confirmed the same control-flow defect.
 
 ### 2. Reclaiming a local stale task breaks worker accounting
 
@@ -77,7 +77,7 @@ Assumed load: multiple executors, routed task names, long-running handlers, and 
 **Verified:** Inserted 100,000 due, unlocked tasks named `other` in the default queue, ran `ANALYZE`, then explained the actual PostgreSQL claim shape for a node registering only `mine`, with a limit of 64. `EXPLAIN (ANALYZE, BUFFERS)` showed:
 
 ```text
-Seq Scan on workq_tasks t
+Seq Scan on workq t
   Rows Removed by Filter: 100000
 Buffers: shared hit=1031
 Execution Time: 7.955 ms
@@ -89,9 +89,9 @@ The reproduction used this query, which matches `claimSQL`'s selection and updat
 
 ```sql
 EXPLAIN (ANALYZE, BUFFERS)
-UPDATE workq_tasks SET locked_at = 1000, version = version + 1
+UPDATE workq SET locked_at = 1000, version = version + 1
 WHERE id = ANY(ARRAY(
-  SELECT id FROM workq_tasks t
+  SELECT id FROM workq t
   WHERE t.failed_at IS NULL AND t.run_at <= 1000
     AND (t.locked_at IS NULL OR t.locked_at < 0)
     AND t.queue = ''

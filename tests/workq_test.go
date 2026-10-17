@@ -234,7 +234,9 @@ func (e env[T]) named(queue string, workers int) *workq.Queue[T] {
 }
 
 func start[T any](t *testing.T, q *workq.Queue[T]) {
-	q.Start(t.Context())
+	if err := q.Start(t.Context()); err != nil {
+		t.Fatal("start:", err)
+	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
@@ -265,7 +267,7 @@ func enqueue[T any](t *testing.T, q *workq.Queue[T], task workq.Task) int64 {
 func count[T any](t *testing.T, e env[T], where string) int {
 	t.Helper()
 	var n int
-	if err := e.db.QueryRow(`SELECT COUNT(*) FROM workq_tasks WHERE ` + where).Scan(&n); err != nil {
+	if err := e.db.QueryRow(`SELECT COUNT(*) FROM workq WHERE ` + where).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	return n
@@ -540,7 +542,7 @@ func testStaleLockIsTakenOver[T any](t *testing.T, e env[T]) {
 	q.Register("x", func(ctx context.Context, p string) error { runs.Add(1); return nil })
 	id := enqueue(t, q, workq.Task{Name: "x"})
 	// a dead node locked it 10 minutes ago
-	if _, err := e.db.Exec(fmt.Sprintf(`UPDATE workq_tasks SET locked_at = %d, version = 1 WHERE id = %d`, time.Now().Add(-10*time.Minute).UnixMilli(), id)); err != nil {
+	if _, err := e.db.Exec(fmt.Sprintf(`UPDATE workq SET locked_at = %d, version = 1 WHERE id = %d`, time.Now().Add(-10*time.Minute).UnixMilli(), id)); err != nil {
 		t.Fatal(err)
 	}
 	start(t, q)
@@ -560,7 +562,7 @@ func testLostLockDiscardsResult[T any](t *testing.T, e env[T]) {
 	}
 	q := e.queue(2)
 	q.LockTimeout = time.Hour
-	takeover := `UPDATE workq_tasks SET version = version + 1 WHERE name = $1`
+	takeover := `UPDATE workq SET version = version + 1 WHERE name = $1`
 	q.Register("plain", func(ctx context.Context, p string) error {
 		_, err := e.db.ExecContext(ctx, takeover, "plain")
 		return err
@@ -619,7 +621,9 @@ func testRunAtAndStop[T any](t *testing.T, e env[T]) {
 	if n := count(t, e, "1=1"); n != 0 {
 		t.Fatalf("stop did not drain: %d rows", n)
 	}
-	q.Start(t.Context()) // for the cleanup's Stop
+	if err := q.Start(t.Context()); err != nil { // for the cleanup's Stop
+		t.Fatal(err)
+	}
 }
 
 func TestStopTimeoutCancelsHandlers(t *testing.T) {
@@ -634,7 +638,9 @@ func testStopTimeoutCancelsHandlers[T any](t *testing.T, e env[T]) {
 		<-ctx.Done()
 		return ctx.Err()
 	})
-	q.Start(t.Context())
+	if err := q.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	enqueue(t, q, workq.Task{Name: "stuck"})
 	<-started
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
@@ -644,6 +650,39 @@ func testStopTimeoutCancelsHandlers[T any](t *testing.T, e env[T]) {
 	}
 	for len(failed(t, q)) == 0 { // the cancelled handler's failure is still stored
 		time.Sleep(time.Second)
+	}
+}
+
+func TestCompletionAfterStopTimeout(t *testing.T) {
+	each(t, testCompletionAfterStopTimeout, testCompletionAfterStopTimeout)
+}
+
+func testCompletionAfterStopTimeout[T any](t *testing.T, e env[T]) {
+	q := e.queue(1)
+	started, completed := make(chan struct{}), make(chan struct{})
+	q.Register("job", func(ctx context.Context, p string) error {
+		close(started)
+		<-ctx.Done()
+		return nil
+	})
+	q.OnEvent = func(ev workq.Event) {
+		if ev.Type == workq.Completed {
+			close(completed)
+		}
+	}
+	if err := q.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	enqueue(t, q, workq.Task{Name: "job"})
+	<-started
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := q.Stop(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal(err)
+	}
+	<-completed
+	if n := count(t, e, "TRUE"); n != 0 {
+		t.Fatalf("%d tasks remain after completion", n)
 	}
 }
 
@@ -736,26 +775,29 @@ func testSlowNodeCannotOverwrite[T any](t *testing.T, e env[T]) {
 	}
 }
 
-func TestRegisterTwicePanics(t *testing.T) {
-	nop := func(ctx context.Context, p string) error { return nil }
-	for name, register := range map[string]func(q *workq.Queue[*sql.Tx]){
-		"Register": func(q *workq.Queue[*sql.Tx]) { q.Register("x", nop) },
-		"RegisterTx": func(q *workq.Queue[*sql.Tx]) {
-			q.RegisterTx("x", func(context.Context, *sql.Tx, string) error { return nil })
-		},
-		"Schedule": func(q *workq.Queue[*sql.Tx]) { q.Schedule("x", workq.Every(time.Hour)) },
-	} {
-		t.Run(name, func(t *testing.T) {
-			q := workq.NewSQLite(nil, "", 1, nil)
-			q.Register("x", nop)
-			q.Schedule("x", workq.Every(time.Hour))
-			defer func() {
-				if recover() == nil {
-					t.Fatal("no panic")
-				}
-			}()
-			register(q)
-		})
+func TestRegistrationErrors(t *testing.T) {
+	nop := func(context.Context, string) error { return nil }
+	q := workq.NewSQLite(nil, "", 1, nil)
+	if err := q.Register("x", nop); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Register("x", nop); err == nil {
+		t.Fatal("duplicate Register succeeded")
+	}
+	if err := q.RegisterTx("x", func(context.Context, *sql.Tx, string) error { return nil }); err == nil {
+		t.Fatal("duplicate RegisterTx succeeded")
+	}
+	if err := q.Schedule("missing", workq.Every(time.Hour)); err == nil {
+		t.Fatal("Schedule before Register succeeded")
+	}
+	if err := q.Schedule("x", nil); err == nil {
+		t.Fatal("nil Schedule succeeded")
+	}
+	if err := q.Schedule("x", workq.Every(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Schedule("x", workq.Every(time.Hour)); err == nil {
+		t.Fatal("duplicate Schedule succeeded")
 	}
 }
 
@@ -786,7 +828,7 @@ func testWorkersCap[T any](t *testing.T, e env[T]) {
 	}
 }
 
-// faultDriver is a database/sql Driver for SQLite that calls hook before each statement on the pool;
+// faultDriver is a database/sql Driver for SQLite that calls hook before each statement;
 // a non-nil error fails the statement. hook may block to delay it.
 type faultDriver struct {
 	db   *sql.DB
@@ -801,10 +843,8 @@ type faultConn struct {
 	hook func(query string) error
 }
 
-func (d faultDriver) DB() workq.Conn { return faultConn{d.db, d.hook} }
-func (d faultDriver) Tx(tx *sql.Tx) workq.Conn {
-	return faultConn{tx, func(string) error { return nil }}
-}
+func (d faultDriver) DB() workq.Conn                               { return faultConn{d.db, d.hook} }
+func (d faultDriver) Tx(tx *sql.Tx) workq.Conn                     { return faultConn{tx, d.hook} }
 func (d faultDriver) SQLite() bool                                 { return true }
 func (d faultDriver) Begin(ctx context.Context) (*sql.Tx, error)   { return d.db.BeginTx(ctx, nil) }
 func (d faultDriver) Commit(_ context.Context, tx *sql.Tx) error   { return tx.Commit() }
@@ -864,7 +904,9 @@ func TestStopTimeoutWithStuckClaim(t *testing.T) {
 			return nil
 		})
 		q.Register("x", func(ctx context.Context, p string) error { return nil })
-		q.Start(t.Context())
+		if err := q.Start(t.Context()); err != nil {
+			t.Fatal(err)
+		}
 		for claims.Load() < 2 {
 			time.Sleep(time.Second)
 		}
@@ -942,23 +984,29 @@ func TestLateHeartbeatKeepsScheduleUnlocked(t *testing.T) {
 	})
 }
 
-func TestScheduleCreatedAfterStartFailure(t *testing.T) {
+func TestStartFailsWhenScheduleCreationFails(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := setupSQLite(t)
 		var inserts atomic.Int32
 		q := faultQueue(e, 1, func(query string) error {
-			if strings.HasPrefix(query, "INSERT") && strings.Contains(query, "scheduled") && inserts.Add(1) == 1 {
+			if strings.HasPrefix(query, "INSERT") && strings.Contains(query, "scheduled") && inserts.Add(1) == 2 {
 				return errors.New("db down")
 			}
 			return nil
 		})
-		var runs atomic.Int32
-		q.Register("tick", func(ctx context.Context, p string) error { runs.Add(1); return nil })
-		q.Schedule("tick", workq.Every(time.Minute))
-		start(t, q)
-		time.Sleep(3 * time.Minute)
-		if count(t, e, "scheduled") != 1 || runs.Load() == 0 {
-			t.Fatalf("schedule rows=%d runs=%d", count(t, e, "scheduled"), runs.Load())
+		for _, name := range []string{"tick", "tock"} {
+			if err := q.Register(name, func(context.Context, string) error { return nil }); err != nil {
+				t.Fatal(err)
+			}
+			if err := q.Schedule(name, workq.Every(time.Minute)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := q.Start(t.Context()); err == nil {
+			t.Fatal("Start succeeded")
+		}
+		if n := count(t, e, "TRUE"); n != 0 {
+			t.Fatalf("%d schedule rows after failed Start", n)
 		}
 	})
 }

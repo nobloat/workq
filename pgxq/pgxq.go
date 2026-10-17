@@ -11,7 +11,6 @@ import (
 	"github.com/nobloat/workq"
 )
 
-// New returns an executor that runs tasks of the given queue ("" is the default queue) with its own worker pool.
 func New(pool *pgxpool.Pool, queue string, workers int, log *slog.Logger) *workq.Queue[pgx.Tx] {
 	return workq.New[pgx.Tx](driver{pool}, queue, workers, log)
 }
@@ -25,7 +24,6 @@ func (d driver) Begin(ctx context.Context) (pgx.Tx, error)     { return d.pool.B
 func (d driver) Commit(ctx context.Context, tx pgx.Tx) error   { return tx.Commit(ctx) }
 func (d driver) Rollback(ctx context.Context, tx pgx.Tx) error { return tx.Rollback(ctx) }
 
-// conn is satisfied by *pgxpool.Pool and pgx.Tx.
 type conn struct {
 	c interface {
 		Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)

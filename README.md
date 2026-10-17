@@ -3,7 +3,7 @@
 A small, persistent task queue for Go, backed by PostgreSQL or SQLite. A simple alternative to [River](https://riverqueue.com/), following the design of [failsafe-executor](https://github.com/oliverselinger/failsafe-executor).
 
 - **One file, no dependencies.** Uses only `database/sql` from the standard library. No reflection. Native [pgx](https://github.com/jackc/pgx) support lives in the separate `pgxq` module.
-- **One table.** All state lives in `workq_tasks`.
+- **One table.** All state lives in `workq`.
 - **At-least-once execution.** A task is deleted only after it succeeds. Tasks held by a crashed node are picked up again once their lock times out.
 - **Transactional.** Enqueue tasks in your own transaction. Run handlers inside a transaction that commits together with the task's removal.
 - **Multi-node.** Nodes coordinate through the database: `FOR UPDATE SKIP LOCKED` on Postgres, `UPDATE … RETURNING` on SQLite, and a version column for optimistic locking.
@@ -33,11 +33,15 @@ if err := q.CreateTable(ctx); err != nil {
     log.Fatal(err)
 }
 
-q.Register("send-email", func(ctx context.Context, param string) error {
+if err := q.Register("send-email", func(ctx context.Context, param string) error {
     return mailer.Send(ctx, param)
-})
+}); err != nil {
+    log.Fatal(err)
+}
 
-q.Start(ctx)
+if err := q.Start(ctx); err != nil {
+    log.Fatal(err)
+}
 defer func() {
     sctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
     defer cancel()
@@ -55,10 +59,12 @@ id, err := q.Enqueue(ctx, workq.Task{Name: "send-email", Param: `{"to":"a@b.c"}`
 pool, _ := pgxpool.New(ctx, dsn)
 q := pgxq.New(pool, "", 8, slog.Default())
 
-q.RegisterTx("charge-order", func(ctx context.Context, tx pgx.Tx, param string) error {
+if err := q.RegisterTx("charge-order", func(ctx context.Context, tx pgx.Tx, param string) error {
     _, err := tx.Exec(ctx, `UPDATE orders SET paid = true WHERE id = $1`, param)
     return err
-})
+}); err != nil {
+    log.Fatal(err)
+}
 ```
 
 Everything else works the same. Other clients can be plugged in by implementing `workq.Driver[T]`.
@@ -68,7 +74,7 @@ Everything else works the same. Other clients can be plugged in by implementing 
 `CreateTable` is idempotent. You can also copy the schema into your own migrations. The two databases differ only in the `id` column:
 
 ```sql
-CREATE TABLE IF NOT EXISTS workq_tasks (
+CREATE TABLE IF NOT EXISTS workq (
   id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, -- SQLite: INTEGER PRIMARY KEY AUTOINCREMENT
   name       TEXT NOT NULL,
   param      TEXT NOT NULL,
@@ -81,26 +87,37 @@ CREATE TABLE IF NOT EXISTS workq_tasks (
   failed_at  BIGINT,
   created_at BIGINT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS workq_tasks_due ON workq_tasks (queue, run_at, id) WHERE failed_at IS NULL;
-CREATE INDEX IF NOT EXISTS workq_tasks_due_name ON workq_tasks (queue, name, run_at, id) WHERE failed_at IS NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS workq_tasks_scheduled ON workq_tasks (name) WHERE scheduled;
+CREATE INDEX IF NOT EXISTS workq_due ON workq (queue, run_at, id) WHERE failed_at IS NULL;
+CREATE INDEX IF NOT EXISTS workq_due_name ON workq (queue, name, run_at, id) WHERE failed_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS workq_scheduled ON workq (name) WHERE scheduled;
 ```
 
 - **IDs** are assigned by the database. On SQLite, `AUTOINCREMENT` ensures the IDs of deleted tasks are never reused.
 - **Times** are stored as Unix milliseconds, which avoids timestamp differences between drivers.
 
+To upgrade an existing database, rename the table, drop its old indexes, then call `CreateTable` to create the renamed indexes:
+
+```sql
+ALTER TABLE workq_tasks RENAME TO workq;
+DROP INDEX workq_tasks_due;
+DROP INDEX workq_tasks_due_name;
+DROP INDEX workq_tasks_scheduled;
+```
+
 ## Registering tasks
 
-A task is a name plus a handler that takes a single string parameter. Return `nil` for success. A returned error, or a recovered panic, marks the task as failed. Registering a name twice panics.
+A task is a name plus a handler that takes a single string parameter. Return `nil` for success. A returned error, or a recovered panic, marks the task as failed. Registration errors include duplicate names.
 
 ```go
-q.Register("send-email", func(ctx context.Context, param string) error {
+if err := q.Register("send-email", func(ctx context.Context, param string) error {
     var m Mail
     if err := json.Unmarshal([]byte(param), &m); err != nil {
         return err
     }
     return mailer.Send(ctx, m)
-})
+}); err != nil {
+    return err
+}
 ```
 
 ### Transactional handlers
@@ -108,14 +125,16 @@ q.Register("send-email", func(ctx context.Context, param string) error {
 `RegisterTx` runs the handler inside a transaction. The task's removal (or, for a scheduled task, its rescheduling) commits in that same transaction. If this node lost the task's lock in the meantime, the transaction is rolled back, so the handler's database writes take effect exactly once.
 
 ```go
-q.RegisterTx("charge-order", func(ctx context.Context, tx *sql.Tx, param string) error {
+if err := q.RegisterTx("charge-order", func(ctx context.Context, tx *sql.Tx, param string) error {
     if _, err := tx.ExecContext(ctx, `UPDATE orders SET paid = true WHERE id = $1`, param); err != nil {
         return err
     }
     // Follow-up tasks commit together with the handler's writes
     _, err := q.EnqueueTx(ctx, tx, workq.Task{Name: "send-email", Param: param})
     return err
-})
+}); err != nil {
+    return err
+}
 ```
 
 The transaction stays open for the whole run. Use `Register` for slow work such as HTTP calls, and keep `RegisterTx` handlers short.
@@ -143,7 +162,9 @@ An executor runs only the tasks of the queue passed to `NewPostgres`/`NewSQLite`
 ```go
 q := workq.NewPostgres(db, "", 8, log)
 mails := workq.NewPostgres(db, "mails", 1, log)
-mails.Register("send-email", send)
+if err := mails.Register("send-email", send); err != nil {
+    log.Fatal(err)
+}
 
 q.Enqueue(ctx, workq.Task{Name: "send-email", Queue: "mails"})
 ```
@@ -161,20 +182,28 @@ type Schedule func(lastSuccess time.Time) time.Time
 Register the handler first, then attach a schedule to its name:
 
 ```go
-q.Register("cleanup", cleanup)
-q.Schedule("cleanup", workq.Every(time.Hour))
+if err := q.Register("cleanup", cleanup); err != nil {
+    log.Fatal(err)
+}
+if err := q.Schedule("cleanup", workq.Every(time.Hour)); err != nil {
+    log.Fatal(err)
+}
 
-q.Register("report", report)
-q.Schedule("report", func(last time.Time) time.Time { // daily at 03:00
+if err := q.Register("report", report); err != nil {
+    log.Fatal(err)
+}
+if err := q.Schedule("report", func(last time.Time) time.Time { // daily at 03:00
     next := time.Date(last.Year(), last.Month(), last.Day(), 3, 0, 0, 0, last.Location())
     if !next.After(last) {
         next = next.AddDate(0, 0, 1)
     }
     return next
-})
+}); err != nil {
+    log.Fatal(err)
+}
 ```
 
-- A scheduled task is stored in the executor's queue, as one row per name, no matter how many nodes register it. A unique index enforces this. Its first run is `schedule(now)` at first registration. Restarts don't reset it. If `Start` can't create the row, the executor retries on every poll.
+- A scheduled task is stored in the executor's queue, as one row per name, no matter how many nodes register it. A unique index enforces this. Its first run is `schedule(now)` at first registration. Restarts don't reset it. `Start` returns an error if it cannot create every initial schedule row.
 - After a successful run, the task is rescheduled to `schedule(finishTime)`.
 - A failed scheduled task stops until it is retried. After a retry it runs immediately, then returns to its schedule.
 - A schedule change in code takes effect after the task's next run.
@@ -227,7 +256,9 @@ q.OnEvent = func(e workq.Event) {
 ## Start and stop
 
 ```go
-q.Start(ctx)
+if err := q.Start(ctx); err != nil {
+    return err
+}
 err := q.Stop(sctx)
 ```
 
@@ -240,8 +271,12 @@ err := q.Stop(sctx)
 ```go
 func TestSignup(t *testing.T) {
     q := workq.NewSQLite(db, "", 1, slog.Default())
-    q.Register("send-email", fakeSend)
-    q.Start(ctx)
+    if err := q.Register("send-email", fakeSend); err != nil {
+        t.Fatal(err)
+    }
+    if err := q.Start(ctx); err != nil {
+        t.Fatal(err)
+    }
     defer q.Stop(ctx)
 
     signup(ctx, q)
@@ -279,6 +314,8 @@ Running tasks send a heartbeat every `LockTimeout / 3`.
 cd tests && go test -run XXX -bench Throughput -benchtime 5000x -count 3 ./...
 ```
 
+The results below predate the removal of batched completion deletes and have not been remeasured. They do not represent current throughput.
+
 Medians of 3 runs with 5,000 tasks each, in tasks per second:
 
 | p  | SQLite enqueue | SQLite exec | Postgres (`database/sql`) enqueue | Postgres (`database/sql`) exec | Postgres (`pgxq`) enqueue | Postgres (`pgxq`) exec |
@@ -290,11 +327,11 @@ Medians of 3 runs with 5,000 tasks each, in tasks per second:
 
 Machine: MacBook Pro (Mac15,10), Apple M3 Max (10 performance + 4 efficiency cores), 36 GB RAM, macOS 26.7.1, Go 1.27.2. SQLite via modernc.org/sqlite v1.60.1, a file on the local SSD with the settings from [Database notes](#database-notes). PostgreSQL 17.11 (`postgres:17-alpine`, default config) in Docker Desktop 29.4.0, accessed with pgx v5.11.0.
 
-- **More workers, more throughput.** Concurrent completions are deleted in one statement, and one claim fills several free workers, so the cost per task drops as load rises.
+- **More workers, more throughput.** One claim fills several free workers. These historical runs also batched completion deletes; the current implementation deletes each completed task directly.
 - **Postgres pays for round trips.** At p=1 every task waits for a claim and a delete round trip. Docker Desktop adds network overhead to each of them, so expect higher numbers with Postgres on a Linux host.
 - **`database/sql` and `pgxq` perform the same.** The driver isn't the bottleneck. Pick `pgxq` for `pgx.Tx` in handlers, not for speed. This only holds when `SetMaxIdleConns` matches `SetMaxOpenConns`; with the default of 2 idle connections, `database/sql` reached only about 2,000 tasks/s at p=64.
 - **Enqueue is one INSERT per task.** It is bounded by round trips on Postgres and by the single writer on SQLite. There is no bulk insert.
-- **Large backlogs don't slow it down.** In separate runs that worked through 1,000,000 tasks already inserted, the rate stayed level from the first task to the last: on Postgres about 30,000 tasks/s with 64 workers and about 66,000 with 2,000 workers, on SQLite about 70,000 with 64 workers. See [How it works](#how-it-works) for what keeps claims cheap. These runs had one task name; with routing, `workq_tasks_due_name` keeps a node from scanning the due tasks of names it doesn't register.
+- **Large backlogs don't slow it down.** In separate runs that worked through 1,000,000 tasks already inserted, the rate stayed level from the first task to the last: on Postgres about 30,000 tasks/s with 64 workers and about 66,000 with 2,000 workers, on SQLite about 70,000 with 64 workers. See [How it works](#how-it-works) for what keeps claims cheap. These runs had one task name; with routing, `workq_due_name` keeps a node from scanning the due tasks of names it doesn't register.
 - **These are upper bounds.** Real tasks add their own run time, and with tasks that take milliseconds or more, the number of workers matters more than workq's overhead.
 
 ### Compared to River
@@ -307,7 +344,7 @@ Machine: MacBook Pro (Mac15,10), Apple M3 Max (10 performance + 4 efficiency cor
 | workq, `pgxq`, 2,000 workers, 14 connections | 15.2 s | 65,712 |
 | workq, `database/sql`, 2,000 workers, 14 connections | 15.1 s | 66,009 |
 
-Each number is a single run. workq's run inserted the tasks with one SQL `INSERT … SELECT generate_series(…)` and counted completions through `OnEvent`; that throwaway test isn't in the repo. Results at p=64 vary by about ±15% between runs.
+These results also predate the removal of batched completion deletes. Each number is a single run. workq's run inserted the tasks with one SQL `INSERT … SELECT generate_series(…)` and counted completions through `OnEvent`; that throwaway test isn't in the repo. Results at p=64 vary by about ±15% between runs.
 
 The comparison only measures overhead per job. River does more for each job: it keeps completed jobs for later inspection instead of deleting them, and it tracks attempts, retries with backoff, priorities and unique jobs. It also has typed job arguments, a web UI and LISTEN/NOTIFY wake-ups. workq has none of these. It offers one file without dependencies, `database/sql` support, and the same API for SQLite and Postgres.
 
@@ -329,4 +366,4 @@ The comparison only measures overhead per job. River does more for each job: it 
    - it hasn't failed
    - it is unlocked, or its lock is stale
 3. **Heartbeat:** a heartbeat refreshes `locked_at` while the task runs.
-4. **Finishing:** every finishing write checks `WHERE id = ? AND version = ?`, so a node whose lock was taken over cannot overwrite the result. Successful `Register` tasks are deleted by one goroutine that combines all deletes waiting while its previous statement ran into one statement: a single delete under light load, up to 100 under heavy load, without waiting for a batch to fill. `RegisterTx` tasks finish inside their own transaction.
+4. **Finishing:** every finishing write checks `WHERE id = ? AND version = ?`, so a node whose lock was taken over cannot overwrite the result. Each worker directly deletes its successful task, or updates its next run time if scheduled. `RegisterTx` tasks finish inside their own transaction.

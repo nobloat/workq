@@ -47,7 +47,9 @@ func benchThroughput[T any](b *testing.B, e env[T], p int) {
 	enqueued := time.Since(begin)
 
 	begin = time.Now()
-	q.Start(ctx)
+	if err := q.Start(ctx); err != nil {
+		b.Fatal(err)
+	}
 	if err := q.Wait(ctx); err != nil {
 		b.Fatal(err)
 	}
