@@ -297,6 +297,9 @@ func testRunAndEvents[T any](t *testing.T, e env[T]) {
 	q.Register("echo", func(ctx context.Context, p string) error {
 		mu.Lock()
 		defer mu.Unlock()
+		if t, ok := workq.TaskFromContext(ctx); !ok || t.Name != "echo" || t.Param != p || t.ID == 0 {
+			return fmt.Errorf("task in context: %+v", t)
+		}
 		got = append(got, p)
 		return nil
 	})

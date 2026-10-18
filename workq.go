@@ -62,6 +62,14 @@ type Event struct {
 	Duration time.Duration
 }
 
+type taskKey struct{}
+
+// TaskFromContext returns the task a handler runs, for example to log its ID.
+func TaskFromContext(ctx context.Context) (Task, bool) {
+	t, ok := ctx.Value(taskKey{}).(Task)
+	return t, ok
+}
+
 type handler struct {
 	fn       func(ctx context.Context, param string) error
 	schedule Schedule
@@ -419,7 +427,7 @@ func (q *Queue[T]) run(ctx context.Context, t Task, version int64, scheduled boo
 	ok := false
 	if scheduled && s == nil {
 		handlerErr = fmt.Errorf("workq: %q is scheduled but has no schedule on this node", t.Name)
-	} else if handlerErr = protect(func() error { return h.fn(ctx, t.Param) }); handlerErr == nil {
+	} else if handlerErr = protect(func() error { return h.fn(context.WithValue(ctx, taskKey{}, t), t.Param) }); handlerErr == nil {
 		ok, err = q.complete(dbCtx, q.d.DB(), t.ID, version, s)
 	}
 	switch {

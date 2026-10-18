@@ -79,6 +79,8 @@ if err := q.Register("send-email", func(ctx context.Context, param string) error
 }
 ```
 
+A handler's context carries its task: `workq.TaskFromContext(ctx)` returns it, for example to add the task's ID to every log line.
+
 ## Enqueueing
 
 `Enqueue` returns the task's ID. `EnqueueTx` does the same inside your transaction, so the task exists only if your transaction commits.
