@@ -62,9 +62,8 @@ type Event struct {
 	Duration time.Duration
 }
 
-type handler[T any] struct {
+type handler struct {
 	fn       func(ctx context.Context, param string) error
-	txFn     func(ctx context.Context, tx T, param string) error
 	schedule Schedule
 }
 
@@ -81,11 +80,12 @@ type Queue[T any] struct {
 	queue    string
 	workers  int
 	log      *slog.Logger
-	handlers map[string]handler[T]
+	handlers map[string]handler
 
 	mu         sync.Mutex
 	running    map[execution]struct{}
 	wg         sync.WaitGroup
+	wake       chan struct{}
 	loopCancel context.CancelFunc
 	runCancel  context.CancelFunc
 	loopDone   chan struct{}
@@ -117,8 +117,9 @@ func New[T any](d Driver[T], queue string, workers int, log *slog.Logger) *Queue
 		queue:        queue,
 		workers:      workers,
 		log:          log,
-		handlers:     map[string]handler[T]{},
+		handlers:     map[string]handler{},
 		running:      map[execution]struct{}{},
+		wake:         make(chan struct{}, 1),
 	}
 }
 
@@ -132,14 +133,10 @@ func (q *Queue[T]) CreateTable(ctx context.Context) error {
 }
 
 func (q *Queue[T]) Register(name string, fn func(ctx context.Context, param string) error) error {
-	return q.register(name, handler[T]{fn: fn})
+	return q.register(name, handler{fn: fn})
 }
 
-func (q *Queue[T]) RegisterTx(name string, fn func(ctx context.Context, tx T, param string) error) error {
-	return q.register(name, handler[T]{txFn: fn})
-}
-
-func (q *Queue[T]) register(name string, h handler[T]) error {
+func (q *Queue[T]) register(name string, h handler) error {
 	if _, ok := q.handlers[name]; ok {
 		return fmt.Errorf("workq: task already registered: %s", name)
 	}
@@ -225,6 +222,7 @@ VALUES ($1, $2, $3, $4, $5) RETURNING id`),
 		return 0, err
 	}
 	q.emit(Event{Type: Enqueued, Task: t})
+	q.notify()
 	return t.ID, nil
 }
 
@@ -261,6 +259,7 @@ WHERE id = $2 AND failed_at IS NOT NULL RETURNING `+taskCols), []any{time.Now().
 		return false, err
 	}
 	q.emit(Event{Type: Retried, Task: t})
+	q.notify()
 	return true, nil
 }
 
@@ -337,6 +336,7 @@ func (q *Queue[T]) poll(ctx, runCtx context.Context) {
 			return
 		case <-tick.C:
 			cursor = nil
+		case <-q.wake:
 		}
 	}
 }
@@ -405,6 +405,7 @@ func (q *Queue[T]) run(ctx context.Context, t Task, version int64, scheduled boo
 		q.mu.Lock()
 		delete(q.running, execution{t.ID, version})
 		q.mu.Unlock()
+		q.notify()
 	}()
 	q.emit(Event{Type: Started, Task: t})
 	start := time.Now()
@@ -416,15 +417,10 @@ func (q *Queue[T]) run(ctx context.Context, t Task, version int64, scheduled boo
 	}
 	var handlerErr, err error
 	ok := false
-	switch {
-	case scheduled && s == nil:
+	if scheduled && s == nil {
 		handlerErr = fmt.Errorf("workq: %q is scheduled but has no schedule on this node", t.Name)
-	case h.txFn != nil:
-		handlerErr, ok, err = q.runTx(ctx, dbCtx, h.txFn, t, version, s)
-	default:
-		if handlerErr = protect(func() error { return h.fn(ctx, t.Param) }); handlerErr == nil {
-			ok, err = q.complete(dbCtx, q.d.DB(), t.ID, version, s)
-		}
+	} else if handlerErr = protect(func() error { return h.fn(ctx, t.Param) }); handlerErr == nil {
+		ok, err = q.complete(dbCtx, q.d.DB(), t.ID, version, s)
 	}
 	if handlerErr != nil {
 		t.Error, t.FailedAt = handlerErr.Error(), time.UnixMilli(time.Now().UnixMilli())
@@ -441,21 +437,6 @@ func (q *Queue[T]) run(ctx context.Context, t Task, version int64, scheduled boo
 	default:
 		q.emit(Event{Type: Completed, Task: t, Duration: time.Since(start)})
 	}
-}
-
-func (q *Queue[T]) runTx(ctx, dbCtx context.Context, fn func(context.Context, T, string) error, t Task, version int64, s Schedule) (handlerErr error, ok bool, err error) {
-	tx, err := q.d.Begin(dbCtx)
-	if err != nil {
-		return nil, false, err
-	}
-	defer q.d.Rollback(dbCtx, tx)
-	if handlerErr = protect(func() error { return fn(ctx, tx, t.Param) }); handlerErr != nil {
-		return handlerErr, false, nil
-	}
-	if ok, err = q.complete(dbCtx, q.d.Tx(tx), t.ID, version, s); !ok || err != nil {
-		return nil, ok, err
-	}
-	return nil, true, q.d.Commit(dbCtx, tx)
 }
 
 func (q *Queue[T]) complete(ctx context.Context, db Conn, id, version int64, s Schedule) (bool, error) {
@@ -512,6 +493,13 @@ func rebind(sqlite bool, query string) string {
 func (q *Queue[T]) emit(e Event) {
 	if q.OnEvent != nil {
 		q.OnEvent(e)
+	}
+}
+
+func (q *Queue[T]) notify() {
+	select {
+	case q.wake <- struct{}{}:
+	default:
 	}
 }
 

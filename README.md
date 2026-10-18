@@ -5,7 +5,7 @@ A small, persistent task queue for Go, backed by PostgreSQL or SQLite. A simple 
 - **One file, no dependencies.** Uses only `database/sql` from the standard library. No reflection. Native [pgx](https://github.com/jackc/pgx) support lives in the separate `pgxq` module.
 - **One table.** All state lives in `workq`.
 - **At-least-once execution.** A task is deleted only after it succeeds. Tasks held by a crashed node are picked up again once their lock times out.
-- **Transactional.** Enqueue tasks in your own transaction. Run handlers inside a transaction that commits together with the task's removal.
+- **Transactional enqueue.** Enqueue, retry, or delete tasks in your own transaction.
 - **Multi-node.** Nodes coordinate through the database: `FOR UPDATE SKIP LOCKED` on Postgres, `UPDATE … RETURNING` on SQLite, and a version column for optimistic locking.
 - **Routing.** A node only picks up tasks whose names it has registered.
 - **Queues.** Each executor runs one queue with its own worker pool.
@@ -19,78 +19,37 @@ go get github.com/nobloat/workq       # database/sql: Postgres or SQLite
 go get github.com/nobloat/workq/pgxq  # native pgx (pgxpool, pgx.Tx)
 ```
 
-Requires PostgreSQL, or SQLite 3.35 or later (for `RETURNING`).
+Requires PostgreSQL, or SQLite 3.35 or later (for `RETURNING`). See the runnable [database/sql](examples/sql/), [pgx](examples/pgx/), [multiple-queue](examples/queues/), and [testing](examples/testing/) examples for complete programs.
 
 ## Quick start
 
 ```go
-db, _ := sql.Open("pgx", dsn)
-db.SetMaxOpenConns(8 + 2) // workers + poll loop + heartbeat
-db.SetMaxIdleConns(8 + 2) // the default of 2 makes busy workers reconnect constantly
+db, err := sql.Open("pgx", dsn)
+if err != nil {
+    log.Fatal(err)
+}
+defer db.Close()
 
-q := workq.NewPostgres(db, "", 8, slog.Default()) // "" = default queue
+q := workq.NewPostgres(db, "", 1, slog.Default())
 if err := q.CreateTable(ctx); err != nil {
     log.Fatal(err)
 }
-
-if err := q.Register("send-email", func(ctx context.Context, param string) error {
-    return mailer.Send(ctx, param)
+if err := q.Register("hello", func(context.Context, string) error {
+    return nil
 }); err != nil {
     log.Fatal(err)
 }
-
 if err := q.Start(ctx); err != nil {
     log.Fatal(err)
 }
-defer func() {
-    sctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-    defer cancel()
-    q.Stop(sctx)
-}()
+defer q.Stop(context.Background())
 
-id, err := q.Enqueue(ctx, workq.Task{Name: "send-email", Param: `{"to":"a@b.c"}`})
+_, err = q.Enqueue(ctx, workq.Task{Name: "hello"})
 ```
-
-### pgx
-
-`workq.Queue[T]` is generic over the transaction type that `RegisterTx` handlers and the `…Tx` methods use. `NewPostgres` and `NewSQLite` return a `*workq.Queue[*sql.Tx]`. `pgxq.New` returns a `*workq.Queue[pgx.Tx]` on a `pgxpool.Pool`:
-
-```go
-pool, _ := pgxpool.New(ctx, dsn)
-q := pgxq.New(pool, "", 8, slog.Default())
-
-if err := q.RegisterTx("charge-order", func(ctx context.Context, tx pgx.Tx, param string) error {
-    _, err := tx.Exec(ctx, `UPDATE orders SET paid = true WHERE id = $1`, param)
-    return err
-}); err != nil {
-    log.Fatal(err)
-}
-```
-
-Everything else works the same. Other clients can be plugged in by implementing `workq.Driver[T]`.
 
 ## Schema
 
-`CreateTable` is idempotent. You can also copy the schema into your own migrations. The two databases differ only in the `id` column:
-
-```sql
-CREATE TABLE IF NOT EXISTS workq (
-  id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, -- SQLite: INTEGER PRIMARY KEY AUTOINCREMENT
-  name       TEXT NOT NULL,
-  param      TEXT NOT NULL,
-  queue      TEXT NOT NULL DEFAULT '',
-  scheduled  BOOLEAN NOT NULL DEFAULT FALSE,
-  run_at     BIGINT NOT NULL,
-  locked_at  BIGINT,
-  version    BIGINT NOT NULL DEFAULT 0,
-  error      TEXT,
-  failed_at  BIGINT,
-  created_at BIGINT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS workq_due ON workq (queue, run_at, id) WHERE failed_at IS NULL;
-CREATE INDEX IF NOT EXISTS workq_due_name ON workq (queue, name, run_at, id) WHERE failed_at IS NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS workq_scheduled ON workq (name) WHERE scheduled;
-```
+`CreateTable` is idempotent. For application-managed migrations, use [schema_postgres.sql](schema_postgres.sql) or [schema_sqlite.sql](schema_sqlite.sql).
 
 - **IDs** are assigned by the database. On SQLite, `AUTOINCREMENT` ensures the IDs of deleted tasks are never reused.
 - **Times** are stored as Unix milliseconds, which avoids timestamp differences between drivers.
@@ -120,25 +79,6 @@ if err := q.Register("send-email", func(ctx context.Context, param string) error
 }
 ```
 
-### Transactional handlers
-
-`RegisterTx` runs the handler inside a transaction. The task's removal (or, for a scheduled task, its rescheduling) commits in that same transaction. If this node lost the task's lock in the meantime, the transaction is rolled back, so the handler's database writes take effect exactly once.
-
-```go
-if err := q.RegisterTx("charge-order", func(ctx context.Context, tx *sql.Tx, param string) error {
-    if _, err := tx.ExecContext(ctx, `UPDATE orders SET paid = true WHERE id = $1`, param); err != nil {
-        return err
-    }
-    // Follow-up tasks commit together with the handler's writes
-    _, err := q.EnqueueTx(ctx, tx, workq.Task{Name: "send-email", Param: param})
-    return err
-}); err != nil {
-    return err
-}
-```
-
-The transaction stays open for the whole run. Use `Register` for slow work such as HTTP calls, and keep `RegisterTx` handlers short.
-
 ## Enqueueing
 
 `Enqueue` returns the task's ID. `EnqueueTx` does the same inside your transaction, so the task exists only if your transaction commits.
@@ -149,24 +89,42 @@ createOrder(tx, order)
 id, err := q.EnqueueTx(ctx, tx, workq.Task{
     Name:  "send-email",
     Param: `{"to":"a@b.c"}`,
-    Queue: "mails",                   // optional; see Queues
+    Queue: "mails",                   // optional; see Multiple queues
     RunAt: time.Now().Add(time.Hour), // optional; defaults to now
 })
 tx.Commit()
 ```
 
-## Queues
+## Multiple queues
 
 An executor runs only the tasks of the queue passed to `NewPostgres`/`NewSQLite`; `""` is the default queue. Give each queue its own executor to size its worker pool independently:
 
 ```go
-q := workq.NewPostgres(db, "", 8, log)
-mails := workq.NewPostgres(db, "mails", 1, log)
-if err := mails.Register("send-email", send); err != nil {
+orders := workq.NewPostgres(db, "", 8, log)       // default queue
+mails := workq.NewPostgres(db, "mails", 1, log)   // one mail worker
+if err := orders.CreateTable(ctx); err != nil {     // once per database
     log.Fatal(err)
 }
 
-q.Enqueue(ctx, workq.Task{Name: "send-email", Queue: "mails"})
+if err := orders.Register("charge-order", chargeOrder); err != nil {
+    log.Fatal(err)
+}
+if err := mails.Register("send-email", sendEmail); err != nil {
+    log.Fatal(err)
+}
+if err := orders.Start(ctx); err != nil {
+    log.Fatal(err)
+}
+if err := mails.Start(ctx); err != nil {
+    log.Fatal(err)
+}
+
+if _, err := orders.Enqueue(ctx, workq.Task{Name: "charge-order", Param: orderID}); err != nil {
+    log.Fatal(err)
+}
+if _, err := orders.Enqueue(ctx, workq.Task{Name: "send-email", Param: orderID, Queue: "mails"}); err != nil {
+    log.Fatal(err)
+}
 ```
 
 There is no ordering guarantee. A queue with one worker runs one task at a time per node, but several nodes still run it in parallel.
@@ -264,9 +222,9 @@ err := q.Stop(sctx)
 
 `Stop` stops claiming new tasks and waits for running ones to finish. When `sctx` expires, the handlers' contexts are cancelled and `Stop` returns, even if a claim is stuck in the database.
 
-## Testing
+## Testing and waiting for tasks
 
-`Wait` blocks until no due or running tasks remain. Failed tasks and tasks scheduled for later don't count.
+Use a real test database, start the queue, then call `Wait` after the code under test enqueues work. `Wait(ctx)` waits for every due task; `Wait(ctx, "send-email")` waits only for the named tasks. Failed tasks and tasks scheduled for later don't count.
 
 ```go
 func TestSignup(t *testing.T) {
@@ -303,8 +261,8 @@ Running tasks send a heartbeat every `LockTimeout / 3`.
 
 ## Database notes
 
-- **Postgres:** each running `RegisterTx` handler holds a connection. Set `db.SetMaxOpenConns` to at least `workers + 2`, summed over all executors sharing the pool, and `db.SetMaxIdleConns` to the same value: with the default of 2, throughput collapses under load because connections are closed and reopened. With pgx, set `MaxConns` on the pool config.
-- **SQLite:** use WAL with `synchronous=NORMAL` and set a `busy_timeout`, for example `?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_txlock=immediate` with modernc.org/sqlite. `synchronous=NORMAL` stops waiting for the disk on every commit: an app crash loses nothing, while a power loss can lose the last commits. That doubled enqueue throughput in the benchmark. `_txlock=immediate` makes transactions take the write lock when they begin, which avoids `SQLITE_BUSY` errors when a read turns into a write. SQLite has a single writer, so workq queues its own statements per `*sql.DB` in Go instead of letting them race for the write lock and back off in SQLite's busy handler. A `RegisterTx` handler that writes still blocks all other writers until it commits.
+- **Postgres:** set `db.SetMaxOpenConns` to at least `workers + 2`, summed over all executors sharing the pool, and `db.SetMaxIdleConns` to the same value: with the default of 2, throughput collapses under load because connections are closed and reopened. With pgx, set `MaxConns` on the pool config.
+- **SQLite:** use WAL with `synchronous=NORMAL` and set a `busy_timeout`, for example `?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_txlock=immediate` with modernc.org/sqlite. `synchronous=NORMAL` stops waiting for the disk on every commit: an app crash loses nothing, while a power loss can lose the last commits. That doubled enqueue throughput in the benchmark. `_txlock=immediate` makes transactions take the write lock when they begin, which avoids `SQLITE_BUSY` errors when a read turns into a write. SQLite has a single writer, so workq queues its own statements per `*sql.DB` in Go instead of letting them race for the write lock and back off in SQLite's busy handler.
 
 ## Performance
 
@@ -314,39 +272,22 @@ Running tasks send a heartbeat every `LockTimeout / 3`.
 cd tests && go test -run XXX -bench Throughput -benchtime 5000x -count 3 ./...
 ```
 
-The results below predate the removal of batched completion deletes and have not been remeasured. They do not represent current throughput.
-
 Medians of 3 runs with 5,000 tasks each, in tasks per second:
 
 | p  | SQLite enqueue | SQLite exec | Postgres (`database/sql`) enqueue | Postgres (`database/sql`) exec | Postgres (`pgxq`) enqueue | Postgres (`pgxq`) exec |
 |----|-------:|-------:|-------:|-------:|-------:|-------:|
-| 1  | 34,363 | 9,084  | 2,903  | 1,216  | 3,038  | 1,171  |
-| 4  | 33,296 | 13,118 | 7,672  | 3,648  | 8,096  | 3,816  |
-| 16 | 34,922 | 35,424 | 15,686 | 13,836 | 15,499 | 13,875 |
-| 64 | 33,677 | 70,276 | 26,885 | 30,978 | 26,068 | 24,735 |
+| 1  | 30,877 | 8,188 | 2,852 | 1,330 | 2,876 | 1,326 |
+| 4  | 28,729 | 11,896 | 8,079 | 3,874 | 8,086 | 3,845 |
+| 16 | 27,323 | 19,911 | 15,415 | 8,459 | 15,830 | 8,580 |
+| 64 | 27,268 | 26,131 | 25,726 | 16,108 | 25,534 | 16,598 |
 
 Machine: MacBook Pro (Mac15,10), Apple M3 Max (10 performance + 4 efficiency cores), 36 GB RAM, macOS 26.7.1, Go 1.27.2. SQLite via modernc.org/sqlite v1.60.1, a file on the local SSD with the settings from [Database notes](#database-notes). PostgreSQL 17.11 (`postgres:17-alpine`, default config) in Docker Desktop 29.4.0, accessed with pgx v5.11.0.
 
-- **More workers, more throughput.** One claim fills several free workers. These historical runs also batched completion deletes; the current implementation deletes each completed task directly.
-- **Postgres pays for round trips.** At p=1 every task waits for a claim and a delete round trip. Docker Desktop adds network overhead to each of them, so expect higher numbers with Postgres on a Linux host.
-- **`database/sql` and `pgxq` perform the same.** The driver isn't the bottleneck. Pick `pgxq` for `pgx.Tx` in handlers, not for speed. This only holds when `SetMaxIdleConns` matches `SetMaxOpenConns`; with the default of 2 idle connections, `database/sql` reached only about 2,000 tasks/s at p=64.
+- **Wake-ups start work promptly.** Enqueuing, retrying, and completing a task signal the poller; one claim fills all free worker slots. The current implementation deletes each completed task directly.
+- **Postgres pays for round trips.** Docker Desktop adds network overhead, so expect higher numbers with Postgres on a Linux host.
+- **`database/sql` and `pgxq` perform the same.** The driver isn't the bottleneck. Pick the client your application already uses. This only holds when `SetMaxIdleConns` matches `SetMaxOpenConns`; with the default of 2 idle connections, `database/sql` reached only about 2,000 tasks/s at p=64.
 - **Enqueue is one INSERT per task.** It is bounded by round trips on Postgres and by the single writer on SQLite. There is no bulk insert.
-- **Large backlogs don't slow it down.** In separate runs that worked through 1,000,000 tasks already inserted, the rate stayed level from the first task to the last: on Postgres about 30,000 tasks/s with 64 workers and about 66,000 with 2,000 workers, on SQLite about 70,000 with 64 workers. See [How it works](#how-it-works) for what keeps claims cheap. These runs had one task name; with routing, `workq_due_name` keeps a node from scanning the due tasks of names it doesn't register.
 - **These are upper bounds.** Real tasks add their own run time, and with tasks that take milliseconds or more, the number of workers matters more than workq's overhead.
-
-### Compared to River
-
-[River](https://riverqueue.com/) ships its own benchmark, `river bench -n 1000000`. It inserts one million no-op jobs, then works them down with 2,000 workers on a default pgx pool. I ran it and the same scenario for workq on the machine and Postgres container above. Only the time to work down the jobs counts; inserting them doesn't:
-
-| | 1,000,000 tasks | tasks/s |
-|---|---:|---:|
-| River v0.49.0 (`river bench`) | 19.3 s | 51,839 |
-| workq, `pgxq`, 2,000 workers, 14 connections | 15.2 s | 65,712 |
-| workq, `database/sql`, 2,000 workers, 14 connections | 15.1 s | 66,009 |
-
-These results also predate the removal of batched completion deletes. Each number is a single run. workq's run inserted the tasks with one SQL `INSERT … SELECT generate_series(…)` and counted completions through `OnEvent`; that throwaway test isn't in the repo. Results at p=64 vary by about ±15% between runs.
-
-The comparison only measures overhead per job. River does more for each job: it keeps completed jobs for later inspection instead of deleting them, and it tracks attempts, retries with backoff, priorities and unique jobs. It also has typed job arguments, a web UI and LISTEN/NOTIFY wake-ups. workq has none of these. It offers one file without dependencies, `database/sql` support, and the same API for SQLite and Postgres.
 
 ## How it works
 
@@ -366,4 +307,4 @@ The comparison only measures overhead per job. River does more for each job: it 
    - it hasn't failed
    - it is unlocked, or its lock is stale
 3. **Heartbeat:** a heartbeat refreshes `locked_at` while the task runs.
-4. **Finishing:** every finishing write checks `WHERE id = ? AND version = ?`, so a node whose lock was taken over cannot overwrite the result. Each worker directly deletes its successful task, or updates its next run time if scheduled. `RegisterTx` tasks finish inside their own transaction.
+4. **Finishing:** every finishing write checks `WHERE id = ? AND version = ?`, so a node whose lock was taken over cannot overwrite the result. Each worker directly deletes its successful task, or updates its next run time if scheduled.

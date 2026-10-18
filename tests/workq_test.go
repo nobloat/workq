@@ -365,54 +365,6 @@ func testFailureRetryDelete[T any](t *testing.T, e env[T]) {
 	}
 }
 
-func TestRegisterTx(t *testing.T) { each(t, testRegisterTx, testRegisterTx) }
-
-func testRegisterTx[T any](t *testing.T, e env[T]) {
-	if _, err := e.db.Exec(`CREATE TABLE orders (id TEXT PRIMARY KEY)`); err != nil {
-		t.Fatal(err)
-	}
-	q := e.queue(2)
-	var followUps atomic.Int32
-	q.RegisterTx("order", func(ctx context.Context, tx T, p string) error {
-		if err := e.exec(ctx, tx, `INSERT INTO orders (id) VALUES ($1)`, p); err != nil {
-			return err
-		}
-		if _, err := q.EnqueueTx(ctx, tx, workq.Task{Name: "follow-up", Param: p}); err != nil {
-			return err
-		}
-		if p == "bad" {
-			return errors.New("rejected")
-		}
-		return nil
-	})
-	q.Register("follow-up", func(ctx context.Context, p string) error {
-		followUps.Add(1)
-		return nil
-	})
-	start(t, q)
-	enqueue(t, q, workq.Task{Name: "order", Param: "good"})
-	enqueue(t, q, workq.Task{Name: "order", Param: "bad"})
-	wait(t, q)
-
-	var ids []string
-	rows, err := e.db.Query(`SELECT id FROM orders`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for rows.Next() {
-		var id string
-		rows.Scan(&id)
-		ids = append(ids, id)
-	}
-	rows.Close()
-	if fmt.Sprint(ids) != "[good]" || followUps.Load() != 1 {
-		t.Fatalf("orders=%v followUps=%d", ids, followUps.Load())
-	}
-	if f := failed(t, q); len(f) != 1 || f[0].Param != "bad" || f[0].Error != "rejected" {
-		t.Fatalf("failed: %+v", f)
-	}
-}
-
 func TestEnqueueTxRollback(t *testing.T) { each(t, testEnqueueTxRollback, testEnqueueTxRollback) }
 
 func testEnqueueTxRollback[T any](t *testing.T, e env[T]) {
@@ -557,9 +509,6 @@ func TestLostLockDiscardsResult(t *testing.T) {
 }
 
 func testLostLockDiscardsResult[T any](t *testing.T, e env[T]) {
-	if _, err := e.db.Exec(`CREATE TABLE orders (id TEXT PRIMARY KEY)`); err != nil {
-		t.Fatal(err)
-	}
 	q := e.queue(2)
 	q.LockTimeout = time.Hour
 	takeover := `UPDATE workq SET version = version + 1 WHERE name = $1`
@@ -567,23 +516,14 @@ func testLostLockDiscardsResult[T any](t *testing.T, e env[T]) {
 		_, err := e.db.ExecContext(ctx, takeover, "plain")
 		return err
 	})
-	q.RegisterTx("tx", func(ctx context.Context, tx T, p string) error {
-		if err := e.exec(ctx, tx, `INSERT INTO orders (id) VALUES ('x')`); err != nil {
-			return err
-		}
-		return e.exec(ctx, tx, takeover, "tx")
-	})
 	enqueue(t, q, workq.Task{Name: "plain"})
-	enqueue(t, q, workq.Task{Name: "tx"})
 	start(t, q)
-	for count(t, e, "locked_at IS NOT NULL") != 2 || count(t, e, "version = 2") != 1 {
+	for count(t, e, "locked_at IS NOT NULL") != 1 || count(t, e, "version = 2") != 1 {
 		time.Sleep(time.Second)
 	}
 	time.Sleep(time.Minute)
-	var n int
-	e.db.QueryRow(`SELECT COUNT(*) FROM orders`).Scan(&n)
-	if n != 0 || count(t, e, "1=1") != 2 || len(failed(t, q)) != 0 {
-		t.Fatalf("orders=%d rows=%d", n, count(t, e, "1=1"))
+	if count(t, e, "1=1") != 1 || len(failed(t, q)) != 0 {
+		t.Fatalf("rows=%d", count(t, e, "1=1"))
 	}
 }
 
@@ -783,9 +723,6 @@ func TestRegistrationErrors(t *testing.T) {
 	}
 	if err := q.Register("x", nop); err == nil {
 		t.Fatal("duplicate Register succeeded")
-	}
-	if err := q.RegisterTx("x", func(context.Context, *sql.Tx, string) error { return nil }); err == nil {
-		t.Fatal("duplicate RegisterTx succeeded")
 	}
 	if err := q.Schedule("missing", workq.Every(time.Hour)); err == nil {
 		t.Fatal("Schedule before Register succeeded")

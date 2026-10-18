@@ -1,4 +1,4 @@
-// Package pgxq runs workq on a native pgx pool, so RegisterTx handlers and EnqueueTx use pgx.Tx.
+// Package pgxq runs workq on a native pgx pool, so the …Tx methods use pgx.Tx.
 package pgxq
 
 import (
