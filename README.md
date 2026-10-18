@@ -19,147 +19,24 @@ go get github.com/nobloat/workq       # database/sql: Postgres or SQLite
 go get github.com/nobloat/workq/pgxq  # native pgx (pgxpool, pgx.Tx)
 ```
 
-Requires PostgreSQL, or SQLite 3.35 or later (for `RETURNING`). See the runnable [database/sql](examples/sql/), [pgx](examples/pgx/), [multiple-queue](examples/queues/), and [testing](examples/testing/) examples for complete programs.
+Requires PostgreSQL, or SQLite 3.35 or later (for `RETURNING`).
 
-## Quick start
+## Examples
 
-```go
-db, err := sql.Open("pgx", dsn)
-if err != nil {
-    log.Fatal(err)
-}
-defer db.Close()
-
-q := workq.NewPostgres(db, "", 1, slog.Default())
-if err := q.CreateTable(ctx); err != nil {
-    log.Fatal(err)
-}
-if err := q.Register("hello", func(context.Context, string) error {
-    return nil
-}); err != nil {
-    log.Fatal(err)
-}
-if err := q.Start(ctx); err != nil {
-    log.Fatal(err)
-}
-defer q.Stop(context.Background())
-
-_, err = q.Enqueue(ctx, workq.Task{Name: "hello"})
-```
-
-## Schema
-
-`CreateTable` is idempotent. For application-managed migrations, use [schema_postgres.sql](schema_postgres.sql) or [schema_sqlite.sql](schema_sqlite.sql).
-
-- **IDs** are assigned by the database. On SQLite, `AUTOINCREMENT` ensures the IDs of deleted tasks are never reused.
-- **Times** are stored as Unix milliseconds, which avoids timestamp differences between drivers.
-
-To upgrade an existing database, rename the table, drop its old indexes, then call `CreateTable` to create the renamed indexes:
-
-```sql
-ALTER TABLE workq_tasks RENAME TO workq;
-DROP INDEX workq_tasks_due;
-DROP INDEX workq_tasks_due_name;
-DROP INDEX workq_tasks_scheduled;
-```
-
-## Registering tasks
-
-A task is a name plus a handler that takes a single string parameter. Return `nil` for success. A returned error, or a recovered panic, marks the task as failed. Registration errors include duplicate names.
-
-```go
-if err := q.Register("send-email", func(ctx context.Context, param string) error {
-    var m Mail
-    if err := json.Unmarshal([]byte(param), &m); err != nil {
-        return err
-    }
-    return mailer.Send(ctx, m)
-}); err != nil {
-    return err
-}
-```
-
-## Enqueueing
-
-`Enqueue` returns the task's ID. `EnqueueTx` does the same inside your transaction, so the task exists only if your transaction commits.
-
-```go
-tx, _ := db.BeginTx(ctx, nil)
-createOrder(tx, order)
-id, err := q.EnqueueTx(ctx, tx, workq.Task{
-    Name:  "send-email",
-    Param: `{"to":"a@b.c"}`,
-    Queue: "mails",                   // optional; see Multiple queues
-    RunAt: time.Now().Add(time.Hour), // optional; defaults to now
-})
-tx.Commit()
-```
+- [`examples/sql/main.go`](examples/sql/main.go): a PostgreSQL queue using `database/sql`.
+- [`examples/pgx/main.go`](examples/pgx/main.go): a PostgreSQL queue using native pgx.
+- [`examples/queues/main.go`](examples/queues/main.go): separate worker pools for order and mail queues.
+- [`examples/testing/workq_test.go`](examples/testing/workq_test.go): testing application code that enqueues work with SQLite.
 
 ## Multiple queues
 
-An executor runs only the tasks of the queue passed to `NewPostgres`/`NewSQLite`; `""` is the default queue. Give each queue its own executor to size its worker pool independently:
-
-```go
-orders := workq.NewPostgres(db, "", 8, log)       // default queue
-mails := workq.NewPostgres(db, "mails", 1, log)   // one mail worker
-if err := orders.CreateTable(ctx); err != nil {     // once per database
-    log.Fatal(err)
-}
-
-if err := orders.Register("charge-order", chargeOrder); err != nil {
-    log.Fatal(err)
-}
-if err := mails.Register("send-email", sendEmail); err != nil {
-    log.Fatal(err)
-}
-if err := orders.Start(ctx); err != nil {
-    log.Fatal(err)
-}
-if err := mails.Start(ctx); err != nil {
-    log.Fatal(err)
-}
-
-if _, err := orders.Enqueue(ctx, workq.Task{Name: "charge-order", Param: orderID}); err != nil {
-    log.Fatal(err)
-}
-if _, err := orders.Enqueue(ctx, workq.Task{Name: "send-email", Param: orderID, Queue: "mails"}); err != nil {
-    log.Fatal(err)
-}
-```
+An executor runs only the tasks of the queue passed to `NewPostgres`/`NewSQLite`; `""` is the default queue. Give each queue its own executor to size its worker pool independently. See [`examples/queues/main.go`](examples/queues/main.go).
 
 There is no ordering guarantee. A queue with one worker runs one task at a time per node, but several nodes still run it in parallel.
 
 ## Scheduled tasks
 
-A schedule is a function that returns the next run time from the time of the last successful run:
-
-```go
-type Schedule func(lastSuccess time.Time) time.Time
-```
-
-Register the handler first, then attach a schedule to its name:
-
-```go
-if err := q.Register("cleanup", cleanup); err != nil {
-    log.Fatal(err)
-}
-if err := q.Schedule("cleanup", workq.Every(time.Hour)); err != nil {
-    log.Fatal(err)
-}
-
-if err := q.Register("report", report); err != nil {
-    log.Fatal(err)
-}
-if err := q.Schedule("report", func(last time.Time) time.Time { // daily at 03:00
-    next := time.Date(last.Year(), last.Month(), last.Day(), 3, 0, 0, 0, last.Location())
-    if !next.After(last) {
-        next = next.AddDate(0, 0, 1)
-    }
-    return next
-}); err != nil {
-    log.Fatal(err)
-}
-```
+A `Schedule` function returns the next run time from the time of the last successful run. Register the handler before attaching its schedule with `Schedule`.
 
 - A scheduled task is stored in the executor's queue, as one row per name, no matter how many nodes register it. A unique index enforces this. Its first run is `schedule(now)` at first registration. Restarts don't reset it. `Start` returns an error if it cannot create every initial schedule row.
 - After a successful run, the task is rescheduled to `schedule(finishTime)`.
@@ -168,36 +45,13 @@ if err := q.Schedule("report", func(last time.Time) time.Time { // daily at 03:0
 
 ## Failures
 
-Errors are stored in the database. Failed tasks stay there until they are retried or deleted.
-
-```go
-failed, err := q.Failed(ctx)
-for _, t := range failed {
-    log.Printf("%d %s failed at %s: %s", t.ID, t.Name, t.FailedAt, t.Error)
-}
-
-ok, err := q.Retry(ctx, id)  // clears the failure; the task runs again
-ok, err = q.Delete(ctx, id)  // gives up on the task
-// RetryTx and DeleteTx do the same inside your transaction
-```
+Errors are stored in the database. Failed tasks stay there until `Retry` (or `RetryTx`) clears the failure, or `Delete` (or `DeleteTx`) removes the task.
 
 There is no automatic retry. To add one, enqueue a delayed copy from the handler or from the `OnEvent` hook.
 
 ## Events
 
-Set `OnEvent` to observe everything workq does, for example for metrics, alerts or a history table:
-
-```go
-q.OnEvent = func(e workq.Event) {
-    switch e.Type {
-    case workq.Failed:
-        alert(e.Task.Name, e.Err)
-    case workq.Completed:
-        db.Exec(`INSERT INTO task_history (id, name, took_ms) VALUES ($1, $2, $3)`,
-            e.Task.ID, e.Task.Name, e.Duration.Milliseconds())
-    }
-}
-```
+Set `OnEvent` to observe everything workq does, for example for metrics, alerts, or a history table.
 
 | Event       | Fired                                                    |
 |-------------|----------------------------------------------------------|
@@ -213,51 +67,15 @@ q.OnEvent = func(e workq.Event) {
 
 ## Start and stop
 
-```go
-if err := q.Start(ctx); err != nil {
-    return err
-}
-err := q.Stop(sctx)
-```
-
-`Stop` stops claiming new tasks and waits for running ones to finish. When `sctx` expires, the handlers' contexts are cancelled and `Stop` returns, even if a claim is stuck in the database.
+`Start` begins polling. `Stop` stops claiming new tasks and waits for running ones to finish. When its context expires, handlers' contexts are cancelled and `Stop` returns, even if a claim is stuck in the database.
 
 ## Testing and waiting for tasks
 
-Use a real test database, start the queue, then call `Wait` after the code under test enqueues work. `Wait(ctx)` waits for every due task; `Wait(ctx, "send-email")` waits only for the named tasks. Failed tasks and tasks scheduled for later don't count.
-
-```go
-func TestSignup(t *testing.T) {
-    q := workq.NewSQLite(db, "", 1, slog.Default())
-    if err := q.Register("send-email", fakeSend); err != nil {
-        t.Fatal(err)
-    }
-    if err := q.Start(ctx); err != nil {
-        t.Fatal(err)
-    }
-    defer q.Stop(ctx)
-
-    signup(ctx, q)
-
-    if err := q.Wait(ctx, "send-email"); err != nil { // no names = wait for all tasks
-        t.Fatal(err)
-    }
-    if f, _ := q.Failed(ctx); len(f) > 0 {
-        t.Fatal(f[0].Error)
-    }
-}
-```
+Use a real test database, start the queue, then call `Wait` after the code under test enqueues work. `Wait(ctx)` waits for every due task; `Wait(ctx, "send-email")` waits only for the named tasks. Failed tasks and tasks scheduled for later don't count. See [`examples/testing/workq_test.go`](examples/testing/workq_test.go).
 
 ## Configuration
 
-```go
-q := workq.NewPostgres(db, queue, workers, logger) // or NewSQLite
-q.PollInterval = time.Second    // how often to look for due tasks (and how often Wait checks)
-q.LockTimeout = 5 * time.Minute // a lock older than this is treated as a dead node
-q.OnEvent = nil                 // event hook
-```
-
-Running tasks send a heartbeat every `LockTimeout / 3`.
+`PollInterval` controls how often the queue looks for due tasks (and `Wait` checks). `LockTimeout` makes an older lock eligible for takeover. `OnEvent` receives queue events. Running tasks send a heartbeat every `LockTimeout / 3`.
 
 ## Database notes
 
@@ -283,13 +101,8 @@ Medians of 3 runs with 5,000 tasks each, in tasks per second:
 
 Machine: MacBook Pro (Mac15,10), Apple M3 Max (10 performance + 4 efficiency cores), 36 GB RAM, macOS 26.7.1, Go 1.27.2. SQLite via modernc.org/sqlite v1.60.1, a file on the local SSD with the settings from [Database notes](#database-notes). PostgreSQL 17.11 (`postgres:17-alpine`, default config) in Docker Desktop 29.4.0, accessed with pgx v5.11.0.
 
-- **Wake-ups start work promptly.** Enqueuing, retrying, and completing a task signal the poller; one claim fills all free worker slots. The current implementation deletes each completed task directly.
-- **Postgres pays for round trips.** Docker Desktop adds network overhead, so expect higher numbers with Postgres on a Linux host.
-- **`database/sql` and `pgxq` perform the same.** The driver isn't the bottleneck. Pick the client your application already uses. This only holds when `SetMaxIdleConns` matches `SetMaxOpenConns`; with the default of 2 idle connections, `database/sql` reached only about 2,000 tasks/s at p=64.
-- **Enqueue is one INSERT per task.** It is bounded by round trips on Postgres and by the single writer on SQLite. There is no bulk insert.
-- **These are upper bounds.** Real tasks add their own run time, and with tasks that take milliseconds or more, the number of workers matters more than workq's overhead.
 
-## How it works
+## Implementation details
 
 1. **Claiming:** every `PollInterval`, an executor claims up to `free workers` due tasks with one statement:
    - **Postgres:** `UPDATE … WHERE id = ANY(ARRAY(SELECT … ORDER BY run_at, id LIMIT n FOR UPDATE SKIP LOCKED)) RETURNING …`.
