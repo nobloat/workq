@@ -382,6 +382,27 @@ func testEnqueueTxRollback[T any](t *testing.T, e env[T]) {
 	}
 }
 
+func TestUniqueIndex(t *testing.T) { each(t, testUniqueIndex, testUniqueIndex) }
+
+func testUniqueIndex[T any](t *testing.T, e env[T]) {
+	if _, err := e.db.Exec(`CREATE UNIQUE INDEX workq_unique ON workq (param) WHERE name = 'once' AND failed_at IS NULL`); err != nil {
+		t.Fatal(err)
+	}
+	q := e.queue(1)
+	if id := enqueue(t, q, workq.Task{Name: "once", Param: "a"}); id == 0 {
+		t.Fatal("first enqueue rejected")
+	}
+	if id := enqueue(t, q, workq.Task{Name: "once", Param: "a"}); id != 0 {
+		t.Fatalf("duplicate enqueued as %d", id)
+	}
+	if _, err := e.db.Exec(`UPDATE workq SET failed_at = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if id := enqueue(t, q, workq.Task{Name: "once", Param: "a"}); id == 0 {
+		t.Fatal("failed task blocked a new one")
+	}
+}
+
 func TestQueues(t *testing.T) { each(t, testQueues, testQueues) }
 
 func testQueues[T any](t *testing.T, e env[T]) {
@@ -463,23 +484,19 @@ func testSchedule[T any](t *testing.T, e env[T]) {
 	wait(t, a) // returns even though a schedule exists
 
 	fail.Store(true)
-	for len(failed(t, a)) == 0 {
+	for count(t, e, "error = 'down'") == 0 {
 		time.Sleep(time.Second)
 	}
-	stopped := runs.Load()
+	failing := runs.Load()
 	time.Sleep(5 * time.Minute)
-	if runs.Load() != stopped {
-		t.Fatal("failed schedule kept running")
+	if runs.Load() < failing+4 || len(failed(t, a)) != 0 {
+		t.Fatalf("failed schedule stopped: runs=%d", runs.Load()-failing)
 	}
 	fail.Store(false)
-	f := failed(t, a)
-	if ok, err := a.Retry(t.Context(), f[0].ID); !ok || err != nil {
-		t.Fatal(ok, err)
-	}
-	for runs.Load() < stopped+2 {
+	for count(t, e, "error IS NULL") == 0 {
 		time.Sleep(time.Second)
 	}
-	if count(t, e, "scheduled") != 1 || len(failed(t, a)) != 0 {
+	if count(t, e, "scheduled") != 1 {
 		t.Fatal("schedule not back to normal")
 	}
 }

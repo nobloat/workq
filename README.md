@@ -9,7 +9,7 @@ A small, persistent task queue for Go, backed by PostgreSQL or SQLite. A simple 
 - **Multi-node.** Nodes coordinate through the database: `FOR UPDATE SKIP LOCKED` on Postgres, `UPDATE … RETURNING` on SQLite, and a version column for optimistic locking.
 - **Routing.** A node only picks up tasks whose names it has registered.
 - **Queues.** Each executor runs one queue with its own worker pool.
-- **Schedules.** Recurring tasks that reschedule themselves after each successful run.
+- **Schedules.** Recurring tasks that reschedule themselves after each run.
 - **Observable.** One hook receives every enqueue, start, completion, failure and retry.
 
 ## Install
@@ -23,10 +23,83 @@ Requires PostgreSQL, or SQLite 3.35 or later (for `RETURNING`).
 
 ## Examples
 
-- [`examples/sql/main.go`](examples/sql/main.go): a PostgreSQL queue using `database/sql`.
-- [`examples/pgx/main.go`](examples/pgx/main.go): a PostgreSQL queue using native pgx.
-- [`examples/queues/main.go`](examples/queues/main.go): separate worker pools for order and mail queues.
-- [`examples/testing/workq_test.go`](examples/testing/workq_test.go): testing application code that enqueues work with SQLite.
+```go
+db, err := sql.Open("pgx", dsn)
+if err != nil {
+    log.Fatal(err)
+}
+defer db.Close()
+
+q := workq.NewPostgres(db, "", 1, slog.Default())
+if err := q.CreateTable(ctx); err != nil {
+    log.Fatal(err)
+}
+if err := q.Register("hello", func(context.Context, string) error {
+    return nil
+}); err != nil {
+    log.Fatal(err)
+}
+if err := q.Start(ctx); err != nil {
+    log.Fatal(err)
+}
+defer q.Stop(context.Background())
+
+_, err = q.Enqueue(ctx, workq.Task{Name: "hello"})
+```
+
+## Schema
+
+`CreateTable` is idempotent. For application-managed migrations, use [schema_postgres.sql](schema_postgres.sql) or [schema_sqlite.sql](schema_sqlite.sql).
+
+- **IDs** are assigned by the database. On SQLite, `AUTOINCREMENT` ensures the IDs of deleted tasks are never reused.
+- **Times** are stored as Unix milliseconds, which avoids timestamp differences between drivers.
+
+To upgrade an existing database, rename the table, drop its old indexes, then call `CreateTable` to create the renamed indexes:
+
+```sql
+ALTER TABLE workq_tasks RENAME TO workq;
+DROP INDEX workq_tasks_due;
+DROP INDEX workq_tasks_due_name;
+DROP INDEX workq_tasks_scheduled;
+```
+
+## Registering tasks
+
+A task is a name plus a handler that takes a single string parameter. Return `nil` for success. A returned error, or a recovered panic, marks the task as failed. Registration errors include duplicate names.
+
+```go
+if err := q.Register("send-email", func(ctx context.Context, param string) error {
+    var m Mail
+    if err := json.Unmarshal([]byte(param), &m); err != nil {
+        return err
+    }
+    return mailer.Send(ctx, m)
+}); err != nil {
+    return err
+}
+```
+
+## Enqueueing
+
+`Enqueue` returns the task's ID. `EnqueueTx` does the same inside your transaction, so the task exists only if your transaction commits.
+
+To deduplicate tasks, add your own partial unique index on the table. A task it rejects is not inserted, and `Enqueue` returns ID 0 without an error. Exclude failed tasks, so they don't block new ones:
+
+```sql
+CREATE UNIQUE INDEX workq_unique_sync ON workq (name, md5(param)) WHERE name = 'sync' AND failed_at IS NULL;
+```
+
+```go
+tx, _ := db.BeginTx(ctx, nil)
+createOrder(tx, order)
+id, err := q.EnqueueTx(ctx, tx, workq.Task{
+    Name:  "send-email",
+    Param: `{"to":"a@b.c"}`,
+    Queue: "mails",                   // optional; see Multiple queues
+    RunAt: time.Now().Add(time.Hour), // optional; defaults to now
+})
+tx.Commit()
+```
 
 ## Multiple queues
 
@@ -40,7 +113,7 @@ A `Schedule` function returns the next run time from the time of the last succes
 
 - A scheduled task is stored in the executor's queue, as one row per name, no matter how many nodes register it. A unique index enforces this. Its first run is `schedule(now)` at first registration. Restarts don't reset it. `Start` returns an error if it cannot create every initial schedule row.
 - After a successful run, the task is rescheduled to `schedule(finishTime)`.
-- A failed scheduled task stops until it is retried. After a retry it runs immediately, then returns to its schedule.
+- A failed run keeps its error in the `error` column and the task runs again at `schedule(finishTime)`; the next successful run clears the error. Scheduled tasks are never returned by `Failed`.
 - A schedule change in code takes effect after the task's next run.
 
 ## Failures

@@ -215,10 +215,10 @@ func (q *Queue[T]) enqueue(ctx context.Context, db Conn, t Task) (int64, error) 
 	}
 	t.RunAt = time.UnixMilli(t.RunAt.UnixMilli())
 	err := db.Query(ctx, rebind(q.d.SQLite(), `INSERT INTO workq (name, param, queue, run_at, created_at)
-VALUES ($1, $2, $3, $4, $5) RETURNING id`),
+VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING RETURNING id`),
 		[]any{t.Name, t.Param, t.Queue, t.RunAt.UnixMilli(), t.CreatedAt.UnixMilli()},
 		func(scan func(...any) error) error { return scan(&t.ID) })
-	if err != nil {
+	if err != nil || t.ID == 0 {
 		return 0, err
 	}
 	q.emit(Event{Type: Enqueued, Task: t})
@@ -422,7 +422,12 @@ func (q *Queue[T]) run(ctx context.Context, t Task, version int64, scheduled boo
 	} else if handlerErr = protect(func() error { return h.fn(ctx, t.Param) }); handlerErr == nil {
 		ok, err = q.complete(dbCtx, q.d.DB(), t.ID, version, s)
 	}
-	if handlerErr != nil {
+	switch {
+	case handlerErr != nil && s != nil:
+		t.Error = handlerErr.Error()
+		ok, err = q.exec(dbCtx, q.d.DB(), `UPDATE workq SET error = $1, run_at = $2, locked_at = NULL WHERE id = $3 AND version = $4`,
+			t.Error, s(time.Now()).UnixMilli(), t.ID, version)
+	case handlerErr != nil:
 		t.Error, t.FailedAt = handlerErr.Error(), time.UnixMilli(time.Now().UnixMilli())
 		ok, err = q.exec(dbCtx, q.d.DB(), `UPDATE workq SET error = $1, failed_at = $2, locked_at = NULL WHERE id = $3 AND version = $4`,
 			t.Error, t.FailedAt.UnixMilli(), t.ID, version)
@@ -443,7 +448,7 @@ func (q *Queue[T]) complete(ctx context.Context, db Conn, id, version int64, s S
 	if s == nil {
 		return q.exec(ctx, db, `DELETE FROM workq WHERE id = $1 AND version = $2`, id, version)
 	}
-	return q.exec(ctx, db, `UPDATE workq SET run_at = $1, locked_at = NULL WHERE id = $2 AND version = $3`,
+	return q.exec(ctx, db, `UPDATE workq SET run_at = $1, locked_at = NULL, error = NULL WHERE id = $2 AND version = $3`,
 		s(time.Now()).UnixMilli(), id, version)
 }
 
