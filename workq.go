@@ -175,6 +175,9 @@ func (q *Queue[T]) Start(ctx context.Context) error {
 			scheduled = append(scheduled, name)
 		}
 	}
+	// Nodes starting at the same time create the same rows in one transaction
+	// each; a fixed order keeps them from deadlocking on each other's inserts.
+	slices.Sort(scheduled)
 	if err := q.createSchedules(ctx, scheduled); err != nil {
 		return err
 	}
