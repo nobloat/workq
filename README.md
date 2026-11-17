@@ -126,6 +126,10 @@ A `Schedule` function returns the next run time from the time of the last succes
 - A failed run keeps its error in the `error` column and the task runs again at `schedule(finishTime)`; the next successful run clears the error. Scheduled tasks are never returned by `Failed`.
 - A schedule change in code takes effect after the task's next run.
 
+## Run now
+
+`RunNow(id)` makes a pending or scheduled task due immediately, for example from an admin UI. A scheduled task then continues from that run. It returns false for running and failed tasks; use `Retry` for failed ones.
+
 ## Failures
 
 Errors are stored in the database. Failed tasks stay there until `Retry` (or `RetryTx`) clears the failure, or `Delete` (or `DeleteTx`) removes the task.

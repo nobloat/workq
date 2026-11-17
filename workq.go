@@ -289,6 +289,17 @@ WHERE id = $2 AND failed_at IS NOT NULL RETURNING `+taskCols), []any{time.Now().
 	return true, nil
 }
 
+// RunNow makes a pending task, or a scheduled one, due immediately. It returns
+// false for a running, failed or unknown task; use Retry for a failed one.
+func (q *Queue[T]) RunNow(ctx context.Context, id int64) (bool, error) {
+	ok, err := q.exec(ctx, q.d.DB(), `UPDATE workq SET run_at = $1 WHERE id = $2 AND failed_at IS NULL AND locked_at IS NULL`,
+		time.Now().UnixMilli(), id)
+	if ok {
+		q.notify()
+	}
+	return ok, err
+}
+
 func (q *Queue[T]) Delete(ctx context.Context, id int64) (bool, error) {
 	return q.exec(ctx, q.d.DB(), deleteSQL, id)
 }

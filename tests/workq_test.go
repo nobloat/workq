@@ -1046,3 +1046,40 @@ func testSetWorkers[T any](t *testing.T, e env[T]) {
 		t.Fatalf("peak concurrency %d, want 3", peak)
 	}
 }
+
+func TestRunNow(t *testing.T) { each(t, testRunNow, testRunNow) }
+
+func testRunNow[T any](t *testing.T, e env[T]) {
+	q := e.queue(1)
+	var runs atomic.Int32
+	q.Register("tick", func(ctx context.Context, p string) error { runs.Add(1); return nil })
+	q.Schedule("tick", workq.Every(time.Hour))
+	q.Register("later", func(ctx context.Context, p string) error { runs.Add(1); return nil })
+	q.Register("broken", func(ctx context.Context, p string) error { return errors.New("down") })
+	start(t, q)
+	later := enqueue(t, q, workq.Task{Name: "later", RunAt: time.Now().Add(time.Hour)})
+	broken := enqueue(t, q, workq.Task{Name: "broken"})
+	wait(t, q)
+	if runs.Load() != 0 {
+		t.Fatal("nothing is due yet")
+	}
+	var tick int64
+	if err := e.db.QueryRow(`SELECT id FROM workq WHERE scheduled`).Scan(&tick); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int64{tick, later} {
+		if ok, err := q.RunNow(t.Context(), id); !ok || err != nil {
+			t.Fatal(id, ok, err)
+		}
+	}
+	if ok, _ := q.RunNow(t.Context(), broken); ok {
+		t.Fatal("RunNow must not revive a failed task")
+	}
+	for runs.Load() < 2 {
+		time.Sleep(time.Second)
+	}
+	// The schedule continues from this run: next run in an hour, not now.
+	if n := count(t, e, fmt.Sprintf("scheduled AND run_at > %d", time.Now().Add(30*time.Minute).UnixMilli())); n != 1 {
+		t.Fatal("schedule not rescheduled after RunNow")
+	}
+}
