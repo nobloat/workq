@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	github.com/jackc/pgx/v5 v5.11.0
-	github.com/nobloat/workq v0.0.0
+	github.com/nobloat/workq v0.1.0
 )
 
 require (
