@@ -63,6 +63,12 @@ DROP INDEX workq_tasks_due_name;
 DROP INDEX workq_tasks_scheduled;
 ```
 
+Tables created before automatic retries need the `attempts` column:
+
+```sql
+ALTER TABLE workq ADD COLUMN attempts INT NOT NULL DEFAULT 0;
+```
+
 ## Registering tasks
 
 A task is a name plus a handler that takes a single string parameter. Return `nil` for success. A returned error, or a recovered panic, marks the task as failed. Registration errors include duplicate names.
@@ -109,6 +115,8 @@ An executor runs only the tasks of the queue passed to `NewPostgres`/`NewSQLite`
 
 There is no ordering guarantee. A queue with one worker runs one task at a time per node, but several nodes still run it in parallel.
 
+`SetWorkers(n)` changes the pool size while running. Lowering it lets running tasks finish; `0` pauses the executor on this node.
+
 ## Scheduled tasks
 
 A `Schedule` function returns the next run time from the time of the last successful run. Register the handler before attaching its schedule with `Schedule`.
@@ -122,7 +130,13 @@ A `Schedule` function returns the next run time from the time of the last succes
 
 Errors are stored in the database. Failed tasks stay there until `Retry` (or `RetryTx`) clears the failure, or `Delete` (or `DeleteTx`) removes the task.
 
-There is no automatic retry. To add one, enqueue a delayed copy from the handler or from the `OnEvent` hook.
+Set `RetryPolicy` to retry automatically. It gets the attempt number (failures so far, including this one) and the error, and returns the delay and whether to retry. A retried task keeps its row, its ID and its error until it succeeds, so a unique index keeps holding. Once the policy returns false, the task fails as above. `Retry` resets the attempt count. Scheduled tasks ignore the policy.
+
+```go
+q.RetryPolicy = func(attempt int, err error) (time.Duration, bool) {
+    return time.Duration(attempt*attempt) * time.Minute, attempt < 10 && !errors.Is(err, errPermanent)
+}
+```
 
 ## Events
 
@@ -133,7 +147,7 @@ Set `OnEvent` to observe everything workq does, for example for metrics, alerts,
 | `Enqueued`  | after the INSERT, on the node that enqueued              |
 | `Started`   | when a worker begins running the task                    |
 | `Completed` | after success is committed; `Duration` is set            |
-| `Failed`    | after the failure is stored; `Err` and `Duration` are set |
+| `Failed`    | after the failure is stored; `Err` and `Duration` are set. `FailedAt` is zero when the task will be retried |
 | `Retried`   | after `Retry` succeeds                                   |
 
 - The hook runs synchronously, so keep it fast.

@@ -967,3 +967,82 @@ func TestStartFailsWhenScheduleCreationFails(t *testing.T) {
 		}
 	})
 }
+
+func TestRetryPolicy(t *testing.T) { each(t, testRetryPolicy, testRetryPolicy) }
+
+func testRetryPolicy[T any](t *testing.T, e env[T]) {
+	q := e.queue(2)
+	permanent := errors.New("permanent")
+	var attempts []int
+	var mu sync.Mutex
+	q.RetryPolicy = func(attempt int, err error) (time.Duration, bool) {
+		mu.Lock()
+		attempts = append(attempts, attempt)
+		mu.Unlock()
+		return time.Second, attempt < 3 && !errors.Is(err, permanent)
+	}
+	var calls atomic.Int32
+	q.Register("flaky", func(ctx context.Context, p string) error {
+		if calls.Add(1) < 3 {
+			return errors.New("transient")
+		}
+		return nil
+	})
+	q.Register("always", func(ctx context.Context, p string) error { return errors.New("down") })
+	q.Register("fatal", func(ctx context.Context, p string) error { return permanent })
+	start(t, q)
+	enqueue(t, q, workq.Task{Name: "flaky"})
+	wait(t, q, "flaky")
+	if calls.Load() != 3 || count(t, e, "name = 'flaky'") != 0 {
+		t.Fatalf("flaky: calls=%d", calls.Load())
+	}
+	always := enqueue(t, q, workq.Task{Name: "always"})
+	fatal := enqueue(t, q, workq.Task{Name: "fatal"})
+	// Wait ignores tasks due later, so poll until both have failed for good.
+	for len(failed(t, q)) < 2 {
+		time.Sleep(time.Second)
+	}
+	f := failed(t, q)
+	if f[0].ID != always || f[0].Attempts != 3 || f[1].ID != fatal || f[1].Attempts != 1 {
+		t.Fatalf("failed: %+v", f)
+	}
+	if ok, err := q.Retry(t.Context(), always); !ok || err != nil {
+		t.Fatal(ok, err)
+	}
+	if n := count(t, e, fmt.Sprint("attempts = 0 AND id = ", always)); n != 1 {
+		t.Fatal("retry must reset attempts")
+	}
+}
+
+func TestSetWorkers(t *testing.T) { each(t, testSetWorkers, testSetWorkers) }
+
+func testSetWorkers[T any](t *testing.T, e env[T]) {
+	var mu sync.Mutex
+	active, peak := 0, 0
+	q := e.queue(1)
+	q.Register("job", func(ctx context.Context, p string) error {
+		mu.Lock()
+		active++
+		peak = max(peak, active)
+		mu.Unlock()
+		time.Sleep(time.Minute)
+		mu.Lock()
+		active--
+		mu.Unlock()
+		return nil
+	})
+	q.SetWorkers(0)
+	for range 6 {
+		enqueue(t, q, workq.Task{Name: "job"})
+	}
+	start(t, q)
+	time.Sleep(5 * time.Second)
+	if count(t, e, "locked_at IS NOT NULL") != 0 {
+		t.Fatal("0 workers must not claim")
+	}
+	q.SetWorkers(3)
+	wait(t, q)
+	if peak != 3 {
+		t.Fatalf("peak concurrency %d, want 3", peak)
+	}
+}

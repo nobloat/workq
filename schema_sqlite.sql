@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS workq (
   version    BIGINT NOT NULL DEFAULT 0,
   error      TEXT,
   failed_at  BIGINT,
+  attempts   INT NOT NULL DEFAULT 0,
   created_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS workq_due ON workq (queue, run_at, id) WHERE failed_at IS NULL;

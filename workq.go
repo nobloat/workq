@@ -43,6 +43,7 @@ type Task struct {
 	CreatedAt time.Time
 	FailedAt  time.Time
 	Error     string
+	Attempts  int // failed runs so far; reset by Retry
 }
 
 type EventType int
@@ -83,6 +84,10 @@ type Queue[T any] struct {
 	PollInterval time.Duration
 	LockTimeout  time.Duration
 	OnEvent      func(Event)
+	// RetryPolicy decides whether a failed task runs again. attempt counts
+	// failures including this one. Nil, or retry false, marks it failed.
+	// Scheduled tasks ignore it.
+	RetryPolicy func(attempt int, err error) (delay time.Duration, retry bool)
 
 	d        Driver[T]
 	queue    string
@@ -138,6 +143,15 @@ func (q *Queue[T]) CreateTable(ctx context.Context) error {
 	}
 	_, err := q.d.DB().Exec(ctx, schema)
 	return err
+}
+
+// SetWorkers changes how many tasks this executor runs at once. Lowering it
+// lets running tasks finish; 0 stops claiming new ones.
+func (q *Queue[T]) SetWorkers(n int) {
+	q.mu.Lock()
+	q.workers = max(n, 0)
+	q.mu.Unlock()
+	q.notify()
 }
 
 func (q *Queue[T]) Register(name string, fn func(ctx context.Context, param string) error) error {
@@ -259,7 +273,7 @@ func (q *Queue[T]) RetryTx(ctx context.Context, tx T, id int64) (bool, error) {
 func (q *Queue[T]) retry(ctx context.Context, db Conn, id int64) (bool, error) {
 	var t Task
 	found := false
-	err := db.Query(ctx, rebind(q.d.SQLite(), `UPDATE workq SET error = NULL, failed_at = NULL, locked_at = NULL, run_at = $1
+	err := db.Query(ctx, rebind(q.d.SQLite(), `UPDATE workq SET error = NULL, failed_at = NULL, locked_at = NULL, attempts = 0, run_at = $1
 WHERE id = $2 AND failed_at IS NOT NULL RETURNING `+taskCols), []any{time.Now().UnixMilli(), id},
 		func(scan func(...any) error) (err error) {
 			t, err = scanTask(scan)
@@ -439,9 +453,21 @@ func (q *Queue[T]) run(ctx context.Context, t Task, version int64, scheduled boo
 		ok, err = q.exec(dbCtx, q.d.DB(), `UPDATE workq SET error = $1, run_at = $2, locked_at = NULL WHERE id = $3 AND version = $4`,
 			t.Error, s(time.Now()).UnixMilli(), t.ID, version)
 	case handlerErr != nil:
-		t.Error, t.FailedAt = handlerErr.Error(), time.UnixMilli(time.Now().UnixMilli())
-		ok, err = q.exec(dbCtx, q.d.DB(), `UPDATE workq SET error = $1, failed_at = $2, locked_at = NULL WHERE id = $3 AND version = $4`,
-			t.Error, t.FailedAt.UnixMilli(), t.ID, version)
+		t.Error, t.Attempts = handlerErr.Error(), t.Attempts+1
+		var delay time.Duration
+		retry := false
+		if q.RetryPolicy != nil {
+			delay, retry = q.RetryPolicy(t.Attempts, handlerErr)
+		}
+		if retry {
+			t.RunAt = time.UnixMilli(time.Now().Add(delay).UnixMilli())
+			ok, err = q.exec(dbCtx, q.d.DB(), `UPDATE workq SET error = $1, attempts = $2, run_at = $3, locked_at = NULL WHERE id = $4 AND version = $5`,
+				t.Error, t.Attempts, t.RunAt.UnixMilli(), t.ID, version)
+		} else {
+			t.FailedAt = time.UnixMilli(time.Now().UnixMilli())
+			ok, err = q.exec(dbCtx, q.d.DB(), `UPDATE workq SET error = $1, attempts = $2, failed_at = $3, locked_at = NULL WHERE id = $4 AND version = $5`,
+				t.Error, t.Attempts, t.FailedAt.UnixMilli(), t.ID, version)
+		}
 	}
 	switch {
 	case err != nil:
@@ -537,14 +563,14 @@ func protect(fn func() error) (err error) {
 	return fn()
 }
 
-const taskCols = `id, name, param, queue, run_at, created_at, failed_at, error`
+const taskCols = `id, name, param, queue, run_at, created_at, failed_at, error, attempts`
 
 func scanTask(scan func(...any) error, extra ...any) (Task, error) {
 	var t Task
 	var errMsg sql.NullString
 	var runAt, createdAt int64
 	var failedAt sql.NullInt64
-	err := scan(append([]any{&t.ID, &t.Name, &t.Param, &t.Queue, &runAt, &createdAt, &failedAt, &errMsg}, extra...)...)
+	err := scan(append([]any{&t.ID, &t.Name, &t.Param, &t.Queue, &runAt, &createdAt, &failedAt, &errMsg, &t.Attempts}, extra...)...)
 	t.Error = errMsg.String
 	t.RunAt, t.CreatedAt = time.UnixMilli(runAt), time.UnixMilli(createdAt)
 	if failedAt.Valid {
