@@ -71,7 +71,7 @@ ALTER TABLE workq ADD COLUMN attempts INT NOT NULL DEFAULT 0;
 
 ## Registering tasks
 
-A task is a name plus a handler that takes a single string parameter. Return `nil` for success. A returned error, or a recovered panic, marks the task as failed. Registration errors include duplicate names.
+A task is a name plus a handler that takes a single string parameter. Return `nil` for success. A returned error, or a recovered panic, marks the task as failed. A panic's error includes its stack trace. Registration errors include duplicate names.
 
 ```go
 if err := q.Register("send-email", func(ctx context.Context, param string) error {

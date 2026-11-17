@@ -344,7 +344,7 @@ func testFailureRetryDelete[T any](t *testing.T, e env[T]) {
 
 	f := failed(t, q)
 	if len(f) != 2 || f[0].ID != flaky || f[0].Error != "boom" || f[0].FailedAt.IsZero() ||
-		f[1].ID != panics || !strings.Contains(f[1].Error, "oops") {
+		f[1].ID != panics || !strings.Contains(f[1].Error, "oops") || !strings.Contains(f[1].Error, "workq_test.go") {
 		t.Fatalf("failed: %+v", f)
 	}
 	if failedEvents.Load() != 2 {

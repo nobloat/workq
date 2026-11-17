@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"maps"
 	"math"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -557,7 +558,7 @@ func in(args []any, names []string) ([]any, string) {
 func protect(fn func() error) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("panic: %v", r)
+			err = fmt.Errorf("panic: %v\n%s", r, debug.Stack())
 		}
 	}()
 	return fn()
